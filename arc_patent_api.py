@@ -755,24 +755,23 @@ def run_incremental_update(
     print(f"Cutoff:     {last_date} (patents with pub_date > this)")
     print(f"Data dir:   {data_dir}")
 
-    # Step 1: refresh zip files if needed
-    refresh_bulk_data(data_dir)
+    # Step 1: Try bulk-file path; fall back to API if files are missing or stale
+    try:
+        refresh_bulk_data(data_dir)
+        matching_ids, cpc_map = _load_cpc_index(corpus_id, cpc_prefix, data_dir)
 
-    # Step 2: build/load CPC index
-    matching_ids, cpc_map = _load_cpc_index(corpus_id, cpc_prefix, data_dir)
+        print(f"  Scanning g_patent.tsv for patents after {last_date}...")
+        new_patents = []   # list of (patent_id, title, pub_date)
+        for patent_id, title, pub_date in _iter_new_patents(matching_ids, cutoff, data_dir):
+            new_patents.append((patent_id, title, pub_date))
 
-    # Step 3: collect new patent IDs from g_patent.tsv
-    print(f"  Scanning g_patent.tsv for patents after {last_date}...")
-    new_patents = []   # list of (patent_id, title, pub_date)
-    for patent_id, title, pub_date in _iter_new_patents(matching_ids, cutoff, data_dir):
-        new_patents.append((patent_id, title, pub_date))
-
-    print(f"  New patents found: {len(new_patents):,}")
+        print(f"  New patents found: {len(new_patents):,}")
+    except FileNotFoundError as e:
+        print(f"  Bulk files not available ({e.filename}). Falling back to API mode.")
+        new_patents = []
 
     if not new_patents:
-        # Bulk files are stale — no patents past the cutoff date.
-        # Fall back to USPTO POST search API for the gap period.
-        print(f"  Bulk files stale (max date {last_date}). Falling back to API mode.")
+        # Bulk files are stale or missing — fall back to USPTO POST search API.
         if not API_KEY:
             print("  ERROR: USPTO_API_KEY not set — cannot use API fallback.",
                   file=sys.stderr)
