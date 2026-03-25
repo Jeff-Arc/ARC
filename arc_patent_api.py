@@ -1039,6 +1039,230 @@ def run_backfill_abstracts(
     print(f"{'='*60}")
 
 
+# ── Bulk URI fetch ────────────────────────────────────────────────────────────
+
+BULK_URI_CACHE_PATH = Path.home() / "arc" / "data" / "ptfw_uri_cache.tsv"
+BULK_URI_DATE_FROM  = "2025-10-01"
+BULK_URI_FIELDS     = [
+    "applicationNumberText",
+    "applicationMetaData.grantDate",
+    "applicationMetaData.inventionTitle",
+    "applicationMetaData.cpcClassificationBag",
+    "grantDocumentMetaData.fileLocationURI",
+]
+
+
+def _load_uri_cache_ids(path: Path) -> set:
+    """Return the set of external_ids already written to ptfw_uri_cache.tsv."""
+    seen: set = set()
+    if not path.exists():
+        return seen
+    with open(path, "r", newline="", encoding="utf-8") as fh:
+        reader = csv.reader(fh, delimiter="\t")
+        next(reader, None)   # skip header row
+        for row in reader:
+            if row:
+                seen.add(row[0])
+    return seen
+
+
+def _post_search_download_page(
+    api_prefix: str,
+    date_from: str,
+    date_to: str,
+    offset: int,
+    api_key: str,
+    retries: int = 3,
+) -> dict:
+    """
+    One page from POST /api/v1/patent/applications/search (full record).
+
+    NOTE: /search/download rejects grantDocumentMetaData.fileLocationURI as an
+    invalid download field and returns an empty bag even with valid fields.
+    The standard /search endpoint returns full file-wrapper records including
+    grantDocumentMetaData.fileLocationURI, which the caller extracts.
+
+    Returns {} on HTTP 404 (no results).
+    Retries up to `retries` times on HTTP 429 with RETRY_DELAY_SEC back-off.
+    Calls are sequential (never parallel) — USPTO burst limit = 1.
+    """
+    payload = {
+        "q": f"applicationMetaData.cpcClassificationBag:{api_prefix}*",
+        "filters": [
+            {
+                "name":  "applicationMetaData.applicationStatusDescriptionText",
+                "value": ["Patented Case"],
+            }
+        ],
+        "rangeFilters": [
+            {
+                "field":     "applicationMetaData.grantDate",
+                "valueFrom": date_from,
+                "valueTo":   date_to,
+            }
+        ],
+        "pagination": {"offset": offset, "limit": API_PAGE_SIZE},
+    }
+    url     = f"{API_BASE}/patent/applications/search"
+    headers = {"X-Api-Key": api_key, "Content-Type": "application/json"}
+
+    for attempt in range(retries):
+        time.sleep(REQUEST_DELAY_SEC)
+        resp = requests.post(url, headers=headers, json=payload, timeout=30)
+        if resp.status_code == 429 and attempt < retries - 1:
+            print(f"  [429] Rate limit — waiting {RETRY_DELAY_SEC}s", file=sys.stderr)
+            time.sleep(RETRY_DELAY_SEC)
+            continue
+        if resp.status_code == 404:
+            return {}
+        resp.raise_for_status()
+        return resp.json()
+
+    raise RuntimeError(f"Failed after {retries} attempts on {url} ({api_prefix})")
+
+
+def run_bulk_uri_fetch(
+    corpus_id: str,
+    dry_run: bool = False,
+    date_from: str = BULK_URI_DATE_FROM,
+) -> int:
+    """
+    Fetch fileLocationURIs for all granted patents in a corpus since date_from.
+
+    Calls POST /api/v1/patent/applications/search/download (Tier 1 metadata
+    quota — does NOT consume the document XML download budget).
+
+    Output TSV at BULK_URI_CACHE_PATH, columns:
+      external_id  corpus_id  title  grant_date  cpc_codes  file_uri
+
+    external_id = patent grant number (matches data_documents.external_id).
+    cpc_codes   = pipe-delimited normalised codes (e.g. H01L21/486|H01L21/768).
+
+    Resume-safe: rows already in the TSV are skipped (keyed by external_id).
+    --dry-run: prints per-corpus counts via the search count endpoint; no writes.
+    """
+    if not API_KEY:
+        print("ERROR: USPTO_API_KEY env var not set", file=sys.stderr)
+        return 0
+
+    corpus_ids = (
+        list(CORPUS_CPC_MAP.keys()) if corpus_id == "all" else [corpus_id]
+    )
+    date_to = date.today().isoformat()
+
+    print(f"\n{'='*60}")
+    print(f"Bulk URI fetch  {date_from} → {date_to}")
+    print(f"{'='*60}")
+
+    # ── dry-run: count only, no file writes ──────────────────────────────────
+    if dry_run:
+        total = 0
+        for cid in corpus_ids:
+            cpc = CORPUS_CPC_MAP.get(cid)
+            if not cpc:
+                print(f"  WARNING: no CPC mapping for {cid}", file=sys.stderr)
+                continue
+            n = count_new_patents(cpc, date_from, date_to)
+            print(f"  {cid:<42} {n:>8,}")
+            total += n
+        print(f"{'='*60}")
+        print(f"  {'TOTAL':<42} {total:>8,}")
+        return total
+
+    # ── live fetch ────────────────────────────────────────────────────────────
+    cache_path = BULK_URI_CACHE_PATH
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+
+    seen_ids     = _load_uri_cache_ids(cache_path)
+    write_header = not cache_path.exists() or cache_path.stat().st_size == 0
+    print(f"  Cache: {len(seen_ids):,} existing external_ids ({cache_path})")
+
+    total_written = 0
+
+    with open(cache_path, "a", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh, delimiter="\t", quoting=csv.QUOTE_MINIMAL)
+        if write_header:
+            writer.writerow(["external_id", "corpus_id", "title",
+                             "grant_date", "cpc_codes", "file_uri"])
+
+        for cid in corpus_ids:
+            cpc_prefix = CORPUS_CPC_MAP.get(cid)
+            if not cpc_prefix:
+                print(f"  WARNING: no CPC mapping for {cid}", file=sys.stderr)
+                continue
+
+            prefixes       = [p.strip() for p in cpc_prefix.split(',')]
+            corpus_written = 0
+            corpus_skipped = 0
+
+            for prefix in prefixes:
+                api_prefix = _api_cpc_prefix(prefix)
+                print(f"\n  [{cid}] {api_prefix}*  ({date_from} → {date_to})",
+                      flush=True)
+                offset = 0
+
+                while True:
+                    data = _post_search_download_page(
+                        api_prefix, date_from, date_to, offset, API_KEY
+                    )
+                    if not data:
+                        break
+
+                    bag = data.get("patentFileWrapperDataBag", [])
+                    if not bag:
+                        break
+
+                    for item in bag:
+                        meta      = item.get("applicationMetaData", {})
+                        grant_num = str(meta.get("patentNumber") or "").strip()
+                        if not grant_num:
+                            # Fallback: application number for records that slipped
+                            # through the Patented Case filter without a grant number
+                            grant_num = str(
+                                item.get("applicationNumberText", "")
+                            ).strip()
+                        if not grant_num:
+                            continue
+
+                        if grant_num in seen_ids:
+                            corpus_skipped += 1
+                            continue
+
+                        title      = meta.get("inventionTitle") or ""
+                        grant_date = meta.get("grantDate") or ""
+                        cpc_codes  = "|".join(
+                            _normalize_cpc(c)
+                            for c in meta.get("cpcClassificationBag", [])
+                        )
+                        file_uri   = (
+                            item.get("grantDocumentMetaData", {})
+                                .get("fileLocationURI") or ""
+                        )
+
+                        writer.writerow([grant_num, cid, title, grant_date,
+                                         cpc_codes, file_uri])
+                        seen_ids.add(grant_num)
+                        corpus_written += 1
+
+                    total_count = data.get("count", 0)
+                    offset     += len(bag)
+
+                    if offset % (API_PAGE_SIZE * 20) == 0:
+                        print(f"    …{offset:,}/{total_count:,}", flush=True)
+
+                    if offset >= total_count:
+                        break
+
+                print(f"    → {corpus_written:,} written, "
+                      f"{corpus_skipped:,} skipped (already cached)")
+                fh.flush()
+
+            total_written += corpus_written
+
+    print(f"\n  Done: {total_written:,} new rows → {cache_path}")
+    return total_written
+
+
 # ── Setup ─────────────────────────────────────────────────────────────────────
 
 def create_cache_table_and_function(conn) -> None:
@@ -1196,13 +1420,14 @@ def parse_args():
     ap = argparse.ArgumentParser(description="USPTO API client for ARC arc_v5")
     ap.add_argument("--mode",
                     choices=["setup", "fulltext", "incremental", "count-new",
-                             "backfill-abstracts"],
+                             "backfill-abstracts", "bulk-uri-fetch"],
                     required=True,
                     help="setup: create cache table + SQL function | "
                          "fulltext: fetch claims for one patent | "
                          "count-new: show new patent counts per corpus | "
                          "incremental: fetch and insert new patents since last ingest | "
-                         "backfill-abstracts: fill NULL abstracts via full-text XML download")
+                         "backfill-abstracts: fill NULL abstracts via full-text XML download | "
+                         "bulk-uri-fetch: fetch fileLocationURIs → ptfw_uri_cache.tsv")
     ap.add_argument("--patent-id",
                     help="Patent application number for --mode fulltext")
     ap.add_argument("--corpus",
@@ -1289,6 +1514,16 @@ def main():
             corpus_id=args.corpus if args.corpus and args.corpus != "all" else None,
             dry_run=args.dry_run,
             limit=args.limit,
+        )
+
+    elif args.mode == "bulk-uri-fetch":
+        if not args.corpus:
+            print("ERROR: --corpus required for --mode bulk-uri-fetch", file=sys.stderr)
+            sys.exit(1)
+        run_bulk_uri_fetch(
+            corpus_id=args.corpus,
+            dry_run=args.dry_run,
+            date_from=args.since or BULK_URI_DATE_FROM,
         )
 
     conn.close()
