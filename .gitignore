@@ -1,0 +1,11 @@
+.env
+*.log
+data/
+logs/
+__pycache__/
+*.pyc
+*.pkl
+*.npz
+*.dump
+*.sql
+ml/models/
