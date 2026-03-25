@@ -63,6 +63,11 @@ _FALLBACK_CORPUS_CONFIGS: dict = {
     "G02B_quarterly":             {"source_type": "patents", "source_filter": "G02B",  "resolution": "quarterly", "year_from": 1990, "year_to": None, "embedding_model": "Qwen/Qwen3-Embedding-0.6B", "domain": None,             "label": "G02B Optics",                "concepts": [], "leiden_res": None, "status": "active"},
     "G06F_quarterly":             {"source_type": "patents", "source_filter": "G06F",  "resolution": "quarterly", "year_from": 1990, "year_to": None, "embedding_model": "Qwen/Qwen3-Embedding-0.6B", "domain": "ai_ml",         "label": "G06F Computing",             "concepts": [], "leiden_res": None, "status": "active"},
     "longevity_cardio_quarterly": {"source_type": "patents", "source_filter": "A61P9", "resolution": "quarterly", "year_from": 1995, "year_to": None, "embedding_model": "Qwen/Qwen3-Embedding-0.6B", "domain": "longevity",     "label": "Longevity Cardio",           "concepts": [], "leiden_res": None, "status": "active"},
+    "A61P9_quarterly":             {"source_type": "patents", "source_filter": "A61P9",  "resolution": "quarterly", "year_from": 1995, "year_to": None, "embedding_model": "Qwen/Qwen3-Embedding-0.6B", "domain": "longevity",     "label": "A61P9 Cardiovascular",       "concepts": [], "leiden_res": None, "status": "active"},
+    "A61P25_quarterly":            {"source_type": "patents", "source_filter": "A61P25", "resolution": "quarterly", "year_from": 1995, "year_to": None, "embedding_model": "Qwen/Qwen3-Embedding-0.6B", "domain": "longevity",     "label": "A61P25 Neurology",           "concepts": [], "leiden_res": None, "status": "active"},
+    "C12N15_quarterly":            {"source_type": "patents", "source_filter": "C12N15", "resolution": "quarterly", "year_from": 1995, "year_to": None, "embedding_model": "Qwen/Qwen3-Embedding-0.6B", "domain": "longevity",     "label": "C12N15 Genetics",            "concepts": [], "leiden_res": None, "status": "active"},
+    "A61K38_quarterly":            {"source_type": "patents", "source_filter": "A61K38", "resolution": "quarterly", "year_from": 1995, "year_to": None, "embedding_model": "Qwen/Qwen3-Embedding-0.6B", "domain": "longevity",     "label": "A61K38 Peptides",            "concepts": [], "leiden_res": None, "status": "active"},
+    "longevity_patents_quarterly": {"source_type": "patents", "source_filter": "A61K38", "resolution": "quarterly", "year_from": 1995, "year_to": None, "embedding_model": "Qwen/Qwen3-Embedding-0.6B", "domain": "longevity",     "label": "Longevity Patents",           "concepts": [], "leiden_res": None, "status": "active"},
 }
 
 PIPELINE_STEPS = [
@@ -251,7 +256,9 @@ def flush_batch(conn, doc_batch: list, chunk_batch: list) -> None:
                    assignee, filing_date, publication_date,
                    cpc_codes, content_date, n_ideas, venue, url)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (document_id) DO NOTHING
+                ON CONFLICT (document_id) DO UPDATE SET
+                    abstract = EXCLUDED.abstract
+                    WHERE data_documents.abstract IS NULL
             """, doc_batch, page_size=DOC_BATCH)
 
             if chunk_batch and _has_data_chunks(conn):

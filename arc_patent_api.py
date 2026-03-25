@@ -949,7 +949,22 @@ def run_backfill_abstracts(
         print("Nothing to do.")
         return
 
+    # ── Load URI cache from ptfw_uri_cache.tsv ──────────────────────────────
+    uri_cache: dict[str, str] = {}
+    cache_path = Path(__file__).resolve().parent / "data" / "ptfw_uri_cache.tsv"
+    if cache_path.exists():
+        with open(cache_path, "r") as fh:
+            header = next(fh)  # skip header
+            for line in fh:
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) >= 6 and parts[5]:  # external_id, ..., file_uri
+                    uri_cache[parts[0]] = parts[5]
+        print(f"URI cache loaded: {len(uri_cache):,} entries from {cache_path.name}")
+    else:
+        print(f"URI cache not found at {cache_path} — all lookups via API")
+
     done = skipped = errors = updated_rows = 0
+    cache_hits = 0
     t0 = time.time()
     pending_commit = 0
 
@@ -962,20 +977,25 @@ def run_backfill_abstracts(
             remaining = (total - i) / rate if rate > 0 else 0
             print(
                 f"  [{i:>6}/{total}]  done={done}  skip={skipped}  err={errors}"
+                f"  cache_hits={cache_hits}"
                 f"  ({rate:.1f}/sec, ~{remaining/60:.1f} min remaining)"
             )
 
         # ── Step 1: search by patent number → fileLocationURI ───────────────
-        # external_id is a patent GRANT number (e.g. 12454767), not an
-        # application number. Must search by patentNumber field — direct
-        # GET /patent/applications/{id} always 404s for recent patents.
-        try:
-            file_uri, uri_source = _fetch_file_uri_by_patent_number(ext_id, api_key)
-        except Exception as e:
-            print(f"  [ERROR] patent number search failed for {ext_id}: {e}",
-                  file=sys.stderr)
-            errors += 1
-            continue
+        # Check URI cache first to skip the POST search API call.
+        ext_id_str = str(ext_id)
+        if ext_id_str in uri_cache:
+            file_uri = uri_cache[ext_id_str]
+            uri_source = "cache"
+            cache_hits += 1
+        else:
+            try:
+                file_uri, uri_source = _fetch_file_uri_by_patent_number(ext_id, api_key)
+            except Exception as e:
+                print(f"  [ERROR] patent number search failed for {ext_id}: {e}",
+                      file=sys.stderr)
+                errors += 1
+                continue
 
         if not file_uri:
             skipped += 1
@@ -1035,6 +1055,7 @@ def run_backfill_abstracts(
     print(f"  Abstracts written:         {done:,}  ({updated_rows:,} rows across corpora)")
     print(f"  Skipped (no URI/abstract): {skipped:,}")
     print(f"  Errors:                    {errors:,}")
+    print(f"  URI cache hits:            {cache_hits:,}")
     print(f"  Elapsed:                   {elapsed/60:.1f} min")
     print(f"{'='*60}")
 
