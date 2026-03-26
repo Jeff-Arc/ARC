@@ -132,6 +132,20 @@ def load_corpus_config(conn, corpus_id: str) -> dict:
         print(f"  [arc_v5 mode] Using fallback config for {corpus_id!r}")
         return cfg
 
+    # Dynamic fallback: any {CPC}_quarterly corpus generates a config automatically
+    if corpus_id.endswith("_quarterly"):
+        cpc_code = corpus_id.replace("_quarterly", "")
+        if re.match(r'^[A-Z]\d{2}[A-Z]$', cpc_code):
+            cfg = {
+                "source_type": "patents", "source_filter": cpc_code,
+                "resolution": "quarterly", "year_from": 1976, "year_to": None,
+                "embedding_model": "Qwen/Qwen3-Embedding-0.6B", "domain": None,
+                "label": cpc_code, "concepts": [], "leiden_res": None,
+                "status": "active", "legacy_name": corpus_id,
+            }
+            print(f"  [arc_v5 mode] Dynamic config for {corpus_id!r} (CPC {cpc_code})")
+            return cfg
+
     print(f"ERROR: corpus_id {corpus_id!r} not found in sys_run_config "
           f"and has no fallback config.", file=sys.stderr)
     print("       Either register in sys_run_config or add to _FALLBACK_CORPUS_CONFIGS.",
