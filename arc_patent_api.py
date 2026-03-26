@@ -79,7 +79,7 @@ import psycopg2
 # ── Config ────────────────────────────────────────────────────────────────────
 
 API_BASE          = "https://api.uspto.gov/api/v1"
-REQUEST_DELAY_SEC = 0.25   # 4 req/sec max (burst=1 enforced by sequential calls)
+REQUEST_DELAY_SEC = 0.10   # 10 req/sec max (burst=1 enforced by sequential calls)
 RETRY_DELAY_SEC   = 5.0    # wait on HTTP 429
 API_KEY           = os.environ.get("USPTO_API_KEY", "")
 
@@ -149,7 +149,7 @@ def fetch_application_metadata(app_number: str, api_key: str) -> dict:
     return bag[0] if bag else {}
 
 
-def fetch_full_text_xml(file_location_uri: str, api_key: str) -> bytes:
+def fetch_full_text_xml(file_location_uri: str, api_key: str, delay: float = None) -> bytes:
     """
     Download full patent XML (abstract + claims + description) from USPTO.
 
@@ -163,7 +163,7 @@ def fetch_full_text_xml(file_location_uri: str, api_key: str) -> bytes:
     """
     # fileLocationURI is returned as an absolute URL by the USPTO API
     url = file_location_uri if file_location_uri.startswith("http") else f"{API_BASE}{file_location_uri}"
-    time.sleep(REQUEST_DELAY_SEC)
+    time.sleep(delay if delay is not None else REQUEST_DELAY_SEC)
     resp = requests.get(url, headers={"X-Api-Key": api_key}, timeout=60)
     resp.raise_for_status()
     return resp.content
@@ -846,7 +846,7 @@ def run_incremental_update(
 
 # ── Backfill abstracts helpers ────────────────────────────────────────────────
 
-def _fetch_file_uri_by_patent_number(patent_number: str, api_key: str) -> "tuple[str|None, str]":
+def _fetch_file_uri_by_patent_number(patent_number: str, api_key: str, delay: float = None) -> "tuple[str|None, str]":
     """
     Search for a patent by its grant number and return (fileLocationURI, source).
 
@@ -863,7 +863,7 @@ def _fetch_file_uri_by_patent_number(patent_number: str, api_key: str) -> "tuple
         "q": f"applicationMetaData.patentNumber:{patent_number}",
         "pagination": {"offset": 0, "limit": 1},
     }
-    time.sleep(REQUEST_DELAY_SEC)
+    time.sleep(delay if delay is not None else REQUEST_DELAY_SEC)
     resp = requests.post(
         f"{API_BASE}/patent/applications/search",
         headers={"X-Api-Key": api_key, "Content-Type": "application/json"},
@@ -968,6 +968,13 @@ def run_backfill_abstracts(
     t0 = time.time()
     pending_commit = 0
 
+    # ── Adaptive rate control ────────────────────────────────────────────────
+    adaptive_delay = REQUEST_DELAY_SEC
+    recent_429s: list[bool] = []       # rolling window of last 10 requests
+    WINDOW_SIZE       = 10
+    SPEEDUP_WINDOW    = 20
+    requests_since_429 = 0
+
     for i, (ext_id, sample_corpus, sample_date) in enumerate(rows, 1):
 
         # ── Progress every 100 ───────────────────────────────────────────────
@@ -981,16 +988,39 @@ def run_backfill_abstracts(
                 f"  ({rate:.1f}/sec, ~{remaining/60:.1f} min remaining)"
             )
 
+        # ── Rate report every 500 ────────────────────────────────────────────
+        if i % 500 == 0:
+            elapsed = time.time() - t0
+            rate = i / elapsed if elapsed > 0 else 0
+            print(f"  [rate] delay={adaptive_delay:.3f}s  effective={rate:.2f}/sec"
+                  f"  429s_in_window={sum(recent_429s[-WINDOW_SIZE:])}")
+
         # ── Step 1: search by patent number → fileLocationURI ───────────────
         # Check URI cache first to skip the POST search API call.
         ext_id_str = str(ext_id)
+        got_429 = False
         if ext_id_str in uri_cache:
             file_uri = uri_cache[ext_id_str]
             uri_source = "cache"
             cache_hits += 1
         else:
             try:
-                file_uri, uri_source = _fetch_file_uri_by_patent_number(ext_id, api_key)
+                file_uri, uri_source = _fetch_file_uri_by_patent_number(ext_id, api_key, delay=adaptive_delay)
+            except requests.exceptions.HTTPError as e:
+                if e.response is not None and e.response.status_code == 429:
+                    got_429 = True
+                print(f"  [ERROR] patent number search failed for {ext_id}: {e}",
+                      file=sys.stderr)
+                errors += 1
+                recent_429s.append(got_429)
+                if got_429:
+                    requests_since_429 = 0
+                # Adaptive: slow down on 429
+                if sum(recent_429s[-2:]) >= 2:
+                    adaptive_delay = min(adaptive_delay + 0.05, 2.0)
+                    print(f"  [rate] 429 burst — slowing to {adaptive_delay:.3f}s")
+                    time.sleep(2.0)  # extra cooldown on burst
+                continue
             except Exception as e:
                 print(f"  [ERROR] patent number search failed for {ext_id}: {e}",
                       file=sys.stderr)
@@ -1010,12 +1040,35 @@ def run_backfill_abstracts(
 
         # ── Step 2: download XML ──────────────────────────────────────────────
         try:
-            xml_bytes = fetch_full_text_xml(file_uri, api_key)
+            xml_bytes = fetch_full_text_xml(file_uri, api_key, delay=adaptive_delay)
+            got_429 = False
+        except requests.exceptions.HTTPError as e:
+            got_429 = e.response is not None and e.response.status_code == 429
+            print(f"  [ERROR] XML download failed for {ext_id}: {e}",
+                  file=sys.stderr)
+            errors += 1
+            recent_429s.append(got_429)
+            if got_429:
+                requests_since_429 = 0
+            if sum(recent_429s[-2:]) >= 2:
+                adaptive_delay = min(adaptive_delay + 0.05, 2.0)
+                print(f"  [rate] 429 burst — slowing to {adaptive_delay:.3f}s")
+                time.sleep(2.0)
+            continue
         except Exception as e:
             print(f"  [ERROR] XML download failed for {ext_id}: {e}",
                   file=sys.stderr)
             errors += 1
             continue
+
+        # ── Adaptive rate: track success and speed up if clean ────────────────
+        recent_429s.append(False)
+        if len(recent_429s) > WINDOW_SIZE:
+            recent_429s = recent_429s[-WINDOW_SIZE:]
+        requests_since_429 += 1
+        if requests_since_429 >= SPEEDUP_WINDOW and adaptive_delay > 0.05:
+            adaptive_delay = max(adaptive_delay - 0.02, 0.05)
+            requests_since_429 = 0
 
         # ── Step 3: parse abstract ────────────────────────────────────────────
         try:
