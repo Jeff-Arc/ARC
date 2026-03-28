@@ -1,0 +1,2662 @@
+=== _check_py_env ===
+
+import sys
+results = [f"Python {sys.version.split()[0]}"]
+for pkg in ['numpy', 'scipy', 'random', 'collections']:
+    try:
+        __import__(pkg)
+        if pkg == 'numpy':
+            import numpy; results.append(f"numpy {numpy.__version__}")
+        elif pkg == 'scipy':
+            import scipy; results.append(f"scipy {scipy.__version__}")
+        else:
+            results.append(f"{pkg} OK")
+    except ImportError as e:
+        results.append(f"{pkg} MISSING: {e}")
+return '\n'.join(results)
+
+
+=== _py_path ===
+
+import sys
+return '\n'.join(sys.path)
+
+
+=== cluster_absorption_capacity ===
+
+import json
+import numpy as np
+
+period_sql = plpy.quote_literal(str(p_period_start))
+corpus_sql = plpy.quote_literal(p_corpus_id)
+
+rv = plpy.execute("""
+    SELECT cluster_id, centroid::float4[] AS c, size, cohesion
+    FROM clusters
+    WHERE period_start = %s
+      AND corpus_id    = %s
+      AND centroid IS NOT NULL
+      AND (is_junk IS NULL OR is_junk = FALSE)
+""" % (period_sql, corpus_sql))
+
+if not rv:
+    return json.dumps({"error": "no clusters in period"})
+
+# p_chunk_vector arrives as string '[f1,f2,...]' from pgvector
+if isinstance(p_chunk_vector, str):
+    v = np.array([float(x) for x in p_chunk_vector.strip('[]').split(',')], dtype=np.float32)
+else:
+    v = np.array(p_chunk_vector, dtype=np.float32)
+v_norm = v / (np.linalg.norm(v) + 1e-9)
+
+best_dist = float('inf')
+best_row  = None
+
+for row in rv:
+    c = np.array(row['c'], dtype=np.float32)
+    c_norm   = c / (np.linalg.norm(c) + 1e-9)
+    cos_dist = float(1.0 - float(np.dot(v_norm, c_norm)))
+    if cos_dist < best_dist:
+        best_dist = cos_dist
+        best_row  = row
+
+n = best_row['size']
+current_cohesion = best_row['cohesion']
+
+# Estimate new cohesion: mean pairwise cosine similarity
+# Adding one chunk with similarity (1 - best_dist) to each existing chunk
+# (approximated via centroid distance)
+# new_cohesion ≈ (old_pairs * cohesion + n * sim_new) / new_pairs
+old_pairs = max(n * (n - 1) / 2, 1)
+new_pairs = max((n + 1) * n / 2, 1)
+sim_new   = max(0.0, 1.0 - best_dist)
+
+if current_cohesion is not None:
+    new_cohesion_est = (old_pairs * current_cohesion + n * sim_new) / new_pairs
+    cohesion_delta   = new_cohesion_est - current_cohesion
+else:
+    new_cohesion_est = None
+    cohesion_delta   = None
+
+return json.dumps({
+    "absorbing_cluster_id":  best_row['cluster_id'],
+    "distance_to_centroid":  round(best_dist, 6),
+    "cohesion_delta":        round(cohesion_delta, 6) if cohesion_delta is not None else None,
+    "new_cohesion_estimate": round(new_cohesion_est, 6) if new_cohesion_est is not None else None,
+    "current_cohesion":      round(current_cohesion, 6) if current_cohesion is not None else None,
+    "cluster_size":          n,
+})
+
+
+=== compute_avg_path_length ===
+
+import json
+import time
+from collections import deque
+
+t0 = time.time()
+
+# ── Read cluster assignments from chunk_periods ───────────────────────────────
+rv = plpy.execute("""
+    SELECT cp.chunk_id::text AS chunk_id, cp.cluster_id
+    FROM chunk_periods cp
+    WHERE cp.period_start = '%s'
+      AND cp.corpus_id    = '%s'
+      AND cp.cluster_id IS NOT NULL
+""" % (p_period_start, p_corpus_id))
+chunk_to_cluster = {row['chunk_id']: row['cluster_id'] for row in rv}
+
+if not chunk_to_cluster:
+    return json.dumps({'error': 'no chunks found', 'n_clusters': 0})
+
+# ── Read edges from knn_edges (not _age_edges — works without AGE session) ───
+rv = plpy.execute("""
+    SELECT chunk_id::text AS chunk_a, neighbor_id::text AS chunk_b
+    FROM knn_edges
+    WHERE period_start = '%s'
+      AND corpus_id    = '%s'
+""" % (p_period_start, p_corpus_id))
+edges_raw = [(row['chunk_a'], row['chunk_b']) for row in rv]
+plpy.notice("compute_avg_path_length: %d chunks, %d edges" % (len(chunk_to_cluster), len(edges_raw)))
+
+# ── Group nodes by cluster ───────────────────────────────────────────────────
+cluster_nodes = {}
+for chunk_id, cluster_id in chunk_to_cluster.items():
+    cluster_nodes.setdefault(cluster_id, set()).add(chunk_id)
+
+# ── Build per-cluster undirected adjacency (intra-cluster edges only) ─────────
+cluster_adj = {cid: {n: set() for n in nodes}
+               for cid, nodes in cluster_nodes.items()}
+for a, b in edges_raw:
+    ca = chunk_to_cluster.get(a)
+    cb = chunk_to_cluster.get(b)
+    if ca is not None and ca == cb:
+        cluster_adj[ca][a].add(b)
+        cluster_adj[ca][b].add(a)
+
+# ── BFS average path length ───────────────────────────────────────────────────
+def bfs_apl(nodes, adj):
+    """
+    Mean shortest path length over all ordered (src, dst) pairs
+    where dst is reachable from src (dst != src).
+    Disconnected pairs are excluded (not counted as infinite).
+    """
+    total_dist  = 0
+    total_pairs = 0
+    for source in nodes:
+        dist  = {source: 0}
+        queue = deque([source])
+        while queue:
+            u = queue.popleft()
+            for v in adj.get(u, ()):
+                if v not in dist:
+                    dist[v] = dist[u] + 1
+                    queue.append(v)
+        for d in dist.values():
+            if d > 0:
+                total_dist  += d
+                total_pairs += 1
+    return total_dist / total_pairs if total_pairs > 0 else 0.0
+
+results = {}   # cluster_id -> (apl, propagation_speed)
+for cluster_id, nodes in cluster_nodes.items():
+    if len(nodes) < 2:
+        apl = 0.0
+    else:
+        apl = bfs_apl(nodes, cluster_adj[cluster_id])
+    ps = 1.0 / apl if apl > 0 else 0.0
+    results[cluster_id] = (apl, ps)
+
+# ── Resolve period text label (clusters table uses period text col) ───────────
+rv_p = plpy.execute("SELECT period_key FROM periods WHERE period_start = '%s'" % p_period_start)
+if not rv_p:
+    return json.dumps({'error': 'period_start %s not in periods table' % p_period_start})
+period = rv_p[0]['period_key']
+
+# ── Write per-cluster values ──────────────────────────────────────────────────
+for cluster_id, (apl, ps) in results.items():
+    apl_sql = '%s' % apl if apl > 0 else 'NULL'
+    ps_sql  = '%s' % ps  if ps  > 0 else 'NULL'
+    plpy.execute("""
+        UPDATE clusters
+        SET avg_path_length = %s, propagation_speed = %s
+        WHERE period = '%s' AND cluster_id = %s
+          AND corpus_id = '%s'
+    """ % (apl_sql, ps_sql, period, cluster_id, p_corpus_id))
+
+# ── Write global_avg_path_length to pipe_period_stats ─────────────────────────────
+valid_apls = [apl for apl, _ in results.values() if apl > 0]
+global_apl = sum(valid_apls) / len(valid_apls) if valid_apls else None
+
+if global_apl is not None:
+    plpy.execute("""
+        UPDATE pipe_period_stats
+        SET global_avg_path_length = %s
+        WHERE period = '%s' AND corpus_id = '%s'
+    """ % (global_apl, period, p_corpus_id))
+
+elapsed = round(time.time() - t0, 3)
+cluster_apls = {str(k): round(v[0], 4) for k, v in results.items() if v[0] > 0}
+
+return json.dumps({
+    'n_clusters':             len(results),
+    'global_avg_path_length': round(global_apl, 4) if global_apl is not None else None,
+    'cluster_apls':           cluster_apls,
+    'elapsed_s':              elapsed,
+})
+
+
+=== compute_betweenness_age ===
+
+import time
+import json
+import random
+import heapq
+from collections import defaultdict
+
+t0 = time.time()
+
+# ── Read config ───────────────────────────────────────────────────────────────
+# Try corpus-specific pivot count first (e.g. BETWEENNESS_PIVOTS_OPENALEX_CS_SAMPLE)
+corpus_key = 'BETWEENNESS_PIVOTS_' + p_corpus_id.upper().replace('-', '_')
+rv = plpy.execute(f"SELECT value FROM pipeline_config WHERE key = '{corpus_key}'")
+if rv:
+    n_pivots = int(rv[0]['value'])
+else:
+    rv = plpy.execute("SELECT value FROM pipeline_config WHERE key = 'BETWEENNESS_PIVOTS'")
+    n_pivots = int(rv[0]['value']) if rv else 100
+
+rv = plpy.execute("SELECT value FROM pipeline_config WHERE key = 'KNN_K'")
+k_value = int(rv[0]['value']) if rv else 8
+
+# ── Build weighted undirected graph from ALL knn_edges ────────────────────────
+# Match arc_pipeline.py: weight = max(1 - distance, 0), undirected max-weight.
+# "Undirected" here: for each pair (a,b), keep max weight over both directions.
+plpy.notice(f"compute_betweenness_age: reading knn_edges for {p_period_start}/{p_corpus_id} k={k_value}")
+rv = plpy.execute(f"""
+    SELECT chunk_id::text AS a, neighbor_id::text AS b, distance::float AS d
+    FROM knn_edges
+    WHERE period_start = '{p_period_start}' AND corpus_id = '{p_corpus_id}'
+      AND k_value = {k_value}
+""")
+
+# Build undirected adjacency: adj[u] = {v: weight}  (max weight wins)
+adj = defaultdict(dict)
+all_nodes = set()
+for row in rv:
+    a, b, d = row['a'], row['b'], row['d']
+    w = max(1.0 - d, 0.0)
+    all_nodes.add(a)
+    all_nodes.add(b)
+    if b not in adj[a] or adj[a][b] < w:
+        adj[a][b] = w
+    if a not in adj[b] or adj[b][a] < w:
+        adj[b][a] = w
+
+# Convert to list-of-(weight, neighbor) for heap efficiency
+adj_list = {u: [(w, v) for v, w in nbrs.items()] for u, nbrs in adj.items()}
+nodes = list(all_nodes)
+n = len(nodes)
+n_isolated = sum(1 for nd in nodes if nd not in adj_list)
+
+plpy.notice(f"  {n} nodes, {sum(len(v) for v in adj_list.values())//2} undirected edges, "
+            f"{n_isolated} isolated, pivots={n_pivots}")
+
+if n < 3:
+    betweenness = {nd: 0.0 for nd in nodes}
+else:
+    # ── Sample source nodes ───────────────────────────────────────────────────
+    rng = random.Random(42)
+    sources = rng.sample(nodes, min(n_pivots, n))
+    k = len(sources)
+
+    betweenness = {nd: 0.0 for nd in nodes}
+
+    # Normalisation: raw_sum over k sources → normalised undirected betweenness
+    # raw_sum ≈ 2 × B[v] × k/n  →  B_norm = raw_sum × n / (k × (n-1)(n-2))
+    scale = n / (k * (n - 1) * (n - 2))
+
+    # ── Weighted Dijkstra-based Brandes' algorithm ────────────────────────────
+    for s in sources:
+        dist  = {s: 0.0}
+        sigma = {s: 1.0}
+        pred  = defaultdict(list)
+        heap  = [(0.0, s)]
+        seen  = {}            # node → settled distance (for Dijkstra correctness)
+        order = []            # settlement order (for backward pass)
+
+        while heap:
+            d_v, v = heapq.heappop(heap)
+            if v in seen:
+                continue
+            seen[v] = d_v
+            order.append(v)
+
+            for w_e, u in adj_list.get(v, []):
+                d_u = d_v + w_e
+                if u not in dist:
+                    dist[u]  = d_u
+                    sigma[u] = sigma[v]
+                    pred[u]  = [v]
+                    heapq.heappush(heap, (d_u, u))
+                elif d_u < dist[u] - 1e-9:
+                    # Shorter path found
+                    dist[u]  = d_u
+                    sigma[u] = sigma[v]
+                    pred[u]  = [v]
+                    heapq.heappush(heap, (d_u, u))
+                elif abs(d_u - dist[u]) < 1e-9:
+                    # Equally short path: accumulate sigma
+                    sigma[u] += sigma[v]
+                    pred[u].append(v)
+
+        # Backward accumulation of pair dependency (Brandes δ)
+        delta = {}
+        while order:
+            w = order.pop()
+            for v in pred[w]:
+                coeff = (sigma[v] / sigma[w]) * (1.0 + delta.get(w, 0.0))
+                delta[v] = delta.get(v, 0.0) + coeff
+            if w != s:
+                betweenness[w] += delta.get(w, 0.0)
+
+    # Apply normalisation
+    for v in betweenness:
+        betweenness[v] *= scale
+
+# ── Read existing betweenness from DB for correlation ─────────────────────────
+rv = plpy.execute(f"""
+    SELECT chunk_id::text, betweenness AS old_btw
+    FROM chunk_periods
+    WHERE period_start = '{p_period_start}' AND corpus_id = '{p_corpus_id}'
+      AND betweenness IS NOT NULL
+""")
+
+old_vals, new_vals = [], []
+for row in rv:
+    cid = row['chunk_id']
+    if cid in betweenness:
+        old_vals.append(float(row['old_btw']))
+        new_vals.append(betweenness[cid])
+
+pearson_r  = None
+spearman_r = None
+if len(old_vals) > 10:
+    try:
+        import numpy as np
+        from scipy.stats import pearsonr, spearmanr
+        oa = np.array(old_vals, dtype=np.float64)
+        na = np.array(new_vals, dtype=np.float64)
+        if oa.std() > 0 and na.std() > 0:
+            pearson_r  = float(round(pearsonr(oa, na)[0],  4))
+            spearman_r = float(round(spearmanr(oa, na)[0], 4))
+        plpy.notice(f"  Correlation old→new: Pearson={pearson_r}, Spearman={spearman_r}")
+    except Exception as e:
+        plpy.warning(f"  Correlation failed: {e}")
+
+# ── Write results to chunk_periods.betweenness ────────────────────────────────
+plpy.execute("DROP TABLE IF EXISTS _btw_staging")
+plpy.execute("CREATE TEMP TABLE _btw_staging (chunk_id text, betweenness real)")
+
+items = list(betweenness.items())
+chunk_size = 2000
+for i in range(0, len(items), chunk_size):
+    batch = items[i:i+chunk_size]
+    values = ','.join(f"('{cid}', {val:.10f})" for cid, val in batch)
+    plpy.execute(f"INSERT INTO _btw_staging VALUES {values}")
+
+plpy.execute(f"""
+    UPDATE chunk_periods cp
+    SET betweenness = s.betweenness
+    FROM _btw_staging s
+    WHERE cp.chunk_id::text = s.chunk_id
+      AND cp.period_start = '{p_period_start}'
+      AND cp.corpus_id    = '{p_corpus_id}'
+""")
+
+elapsed = round(time.time() - t0, 3)
+plpy.notice(f"compute_betweenness_age: done in {elapsed}s")
+
+return json.dumps({
+    'n_nodes':         n,
+    'n_isolated':      n_isolated,
+    'n_pivots':        min(n_pivots, n),
+    'pearson_r':       pearson_r,
+    'spearman_r':      spearman_r,
+    'max_betweenness': float(round(max(betweenness.values()), 6)) if betweenness else 0.0,
+    'avg_betweenness': float(round(sum(betweenness.values()) / n, 6)) if n else 0.0,
+    'seconds':         elapsed,
+})
+
+
+=== compute_cluster_reachability ===
+
+import time, json
+from collections import defaultdict
+
+t0 = time.time()
+
+# ── Config ─────────────────────────────────────────────────────────────────────
+rv = plpy.execute("SELECT value FROM pipeline_config WHERE key = 'REACHABILITY_HOPS'")
+n_hops = int(rv[0]['value']) if rv else 3
+
+rv = plpy.execute("SELECT value::int FROM pipeline_config WHERE key = 'KNN_K' LIMIT 1")
+knn_k = rv[0]['value'] if rv else 8
+
+rv = plpy.execute("SELECT value::float FROM pipeline_config WHERE key = 'LP_DISTANCE_PERCENTILE' LIMIT 1")
+pct = (rv[0]['value'] / 100.0) if rv else 0.20
+
+# ── Adaptive distance cutoff ───────────────────────────────────────────────────
+rv = plpy.execute(f"""
+    SELECT percentile_cont({pct}) WITHIN GROUP (ORDER BY distance) AS cutoff
+    FROM knn_edges
+    WHERE period_start = '{p_period_start}'
+      AND corpus_id    = '{p_corpus_id}'
+      AND k_value      = {knn_k}
+""")
+cutoff = rv[0]['cutoff'] if rv and rv[0]['cutoff'] is not None else 0.4
+
+# ── Build mutual-kNN adjacency from knn_edges ──────────────────────────────────
+# Mutual: edge (a,b) included only if both a→b and b→a exist within cutoff.
+rv = plpy.execute(f"""
+    SELECT a.chunk_id::text AS chunk_a, a.neighbor_id::text AS chunk_b
+    FROM knn_edges a
+    JOIN knn_edges b
+      ON  a.chunk_id    = b.neighbor_id
+      AND a.neighbor_id = b.chunk_id
+      AND a.period_start = b.period_start
+      AND a.corpus_id    = b.corpus_id
+      AND a.k_value      = b.k_value
+    WHERE a.period_start = '{p_period_start}'
+      AND a.corpus_id    = '{p_corpus_id}'
+      AND a.k_value      = {knn_k}
+      AND a.distance < {cutoff}
+      AND b.distance < {cutoff}
+""")
+
+adj = defaultdict(set)
+for row in rv:
+    a, b = row['chunk_a'], row['chunk_b']
+    adj[a].add(b)
+    adj[b].add(a)
+
+n_edges = sum(len(v) for v in adj.values()) // 2
+
+# ── chunk → cluster mapping ────────────────────────────────────────────────────
+rv = plpy.execute(f"""
+    SELECT chunk_id::text AS chunk_id, cluster_id
+    FROM chunk_periods
+    WHERE period_start = '{p_period_start}'
+      AND corpus_id    = '{p_corpus_id}'
+      AND cluster_id   IS NOT NULL
+""")
+chunk_cluster = {}
+cluster_chunks = defaultdict(set)
+for row in rv:
+    cid = row['chunk_id']
+    cl  = row['cluster_id']
+    chunk_cluster[cid] = cl
+    cluster_chunks[cl].add(cid)
+
+if not cluster_chunks:
+    return json.dumps({'n_clusters': 0, 'seconds': round(time.time() - t0, 3)})
+
+# ── Multi-source BFS per cluster ───────────────────────────────────────────────
+reachability = {}
+for cluster_id, seeds in cluster_chunks.items():
+    visited  = set(seeds)
+    frontier = set(seeds)
+    for _ in range(n_hops):
+        nxt = set()
+        for node in frontier:
+            for nbr in adj.get(node, set()):
+                if nbr not in visited:
+                    visited.add(nbr)
+                    nxt.add(nbr)
+        if not nxt:
+            break
+        frontier = nxt
+
+    reachable = set()
+    for node in visited:
+        if node not in seeds:
+            c = chunk_cluster.get(node)
+            if c is not None and c != cluster_id:
+                reachable.add(c)
+    reachability[cluster_id] = len(reachable)
+
+plpy.notice(f"compute_cluster_reachability: {len(reachability)} clusters, "
+            f"n_hops={n_hops}, cutoff={round(cutoff,4)}, "
+            f"n_edges={n_edges}, max_reach={max(reachability.values(), default=0)}")
+
+# ── Write results — no temp tables, single UPDATE ... FROM (VALUES ...) ────────
+# Avoids all CREATE/DROP table lock overhead. Safe under high pipeline concurrency.
+if reachability:
+    vals = ','.join(f"({cl},{r})" for cl, r in reachability.items())
+    plpy.execute(f"""
+        UPDATE pipe_clusters AS c
+        SET cluster_reachability = v.reachability
+        FROM (VALUES {vals}) AS v(cluster_id, reachability)
+        WHERE c.cluster_id   = v.cluster_id::int
+          AND c.period_start = '{p_period_start}'
+          AND c.corpus_id    = '{p_corpus_id}'
+    """)
+
+elapsed = round(time.time() - t0, 3)
+return json.dumps({
+    'n_clusters':        len(reachability),
+    'n_hops':            n_hops,
+    'n_edges':           n_edges,
+    'cutoff':            round(cutoff, 4),
+    'max_reachability':  max(reachability.values(), default=0),
+    'mean_reachability': round(sum(reachability.values()) / len(reachability), 2)
+                         if reachability else 0,
+    'seconds':           elapsed,
+})
+
+
+=== compute_graph_diameter ===
+
+from collections import deque
+
+# ── Fetch cluster edges ──────────────────────────────────────────────────────────
+rv = plpy.execute(f"""
+    SELECT cluster_a, cluster_b
+    FROM pipe_cluster_edges
+    WHERE period_start = '{p_period_start}'
+      AND corpus_id    = '{p_corpus_id}'
+""")
+
+# Build undirected adjacency dict
+adj = {}
+for row in rv:
+    a, b = int(row['cluster_a']), int(row['cluster_b'])
+    adj.setdefault(a, []).append(b)
+    adj.setdefault(b, []).append(a)
+
+nodes = list(adj.keys())
+n = len(nodes)
+
+if n < 2:
+    plpy.notice(f"compute_graph_diameter: only {n} nodes for corpus={p_corpus_id} "
+                f"period={p_period_start}, skipping")
+    return
+
+# ── BFS from every node (cluster graph is small: 20-100 nodes) ──────────────────
+def bfs_distances(src):
+    """Return list of finite distances from src to all reachable nodes."""
+    dist = {src: 0}
+    q = deque([src])
+    while q:
+        u = q.popleft()
+        d = dist[u]
+        for v in adj.get(u, []):
+            if v not in dist:
+                dist[v] = d + 1
+                q.append(v)
+    return list(dist.values())
+
+max_dist = 0
+total_dist = 0
+total_pairs = 0
+
+for node in nodes:
+    dists = bfs_distances(node)
+    if len(dists) > 1:
+        finite = [d for d in dists if d > 0]
+        if finite:
+            max_dist = max(max_dist, max(finite))
+            total_dist += sum(finite)
+            total_pairs += len(finite)
+
+avg_path = float(total_dist) / total_pairs if total_pairs > 0 else 0.0
+
+# ── Write to pipe_period_stats ────────────────────────────────────────────────────
+plpy.execute(f"""
+    UPDATE pipe_period_stats
+    SET graph_diameter         = {int(max_dist)},
+        global_avg_path_length = {avg_path}
+    WHERE period_start = '{p_period_start}'
+      AND corpus_id    = '{p_corpus_id}'
+""")
+
+plpy.notice(f"compute_graph_diameter: n_nodes={n} diameter={max_dist} "
+            f"avg_path={avg_path:.4f} corpus={p_corpus_id} period={p_period_start}")
+
+
+=== compute_graph_distance ===
+
+import time, json
+from collections import defaultdict, deque
+
+t0 = time.time()
+
+# chunk -> cluster mapping
+rv = plpy.execute(f"""
+    SELECT chunk_id::text AS chunk_id, cluster_id
+    FROM chunk_periods
+    WHERE period_start = '{p_period_start}'
+      AND corpus_id    = '{p_corpus_id}'
+      AND cluster_id   IS NOT NULL
+""")
+chunk_cluster = {}
+cluster_chunks = defaultdict(set)
+for row in rv:
+    cid = row['chunk_id']
+    cl  = row['cluster_id']
+    chunk_cluster[cid] = cl
+    cluster_chunks[cl].add(cid)
+
+# Build undirected adjacency
+# Try _age_edges first (AGE/LP sessions); fall back to knn_edges
+adj = defaultdict(set)
+age_available = False
+try:
+    plpy.execute('SELECT 1 FROM _age_edges LIMIT 0')
+    age_available = True
+except Exception:
+    pass
+
+if age_available:
+    rv = plpy.execute('SELECT chunk_a, chunk_b FROM _age_edges')
+    for row in rv:
+        a, b = row['chunk_a'], row['chunk_b']
+        adj[a].add(b)
+        adj[b].add(a)
+    plpy.notice('compute_graph_distance: using _age_edges for adjacency')
+else:
+    knn_k_row = plpy.execute("SELECT value::int FROM pipeline_config WHERE key = 'KNN_K' LIMIT 1")
+    knn_k = knn_k_row[0]['value'] if knn_k_row else 16
+    rv = plpy.execute(f"""
+        SELECT chunk_id::text AS chunk_id, neighbor_id::text AS neighbor_id
+        FROM knn_edges
+        WHERE period_start = '{p_period_start}'
+          AND corpus_id    = '{p_corpus_id}'
+          AND k_value      <= {knn_k}
+    """)
+    for row in rv:
+        a, b = row['chunk_id'], row['neighbor_id']
+        adj[a].add(b)
+        adj[b].add(a)
+    plpy.notice(f'compute_graph_distance: using knn_edges (k<={knn_k}) for adjacency')
+
+# cluster_edge pairs
+rv = plpy.execute(f"""
+    SELECT cluster_a, cluster_b
+    FROM pipe_cluster_edges
+    WHERE period_start = '{p_period_start}'
+      AND corpus_id    = '{p_corpus_id}'
+""")
+pairs = [(row['cluster_a'], row['cluster_b']) for row in rv]
+plpy.notice(f'compute_graph_distance: {len(pairs)} cluster_edge pairs')
+
+def bfs_min_hops(seeds_a, target_b, adj):
+    visited = set(seeds_a)
+    queue   = deque((n, 0) for n in seeds_a)
+    while queue:
+        node, hops = queue.popleft()
+        if node in target_b:
+            return hops
+        for nbr in adj.get(node, set()):
+            if nbr not in visited:
+                visited.add(nbr)
+                queue.append((nbr, hops + 1))
+    return None
+
+results = {}
+for ca, cb in pairs:
+    seeds_a  = cluster_chunks.get(ca, set())
+    target_b = cluster_chunks.get(cb, set())
+    if seeds_a and target_b:
+        results[(ca, cb)] = bfs_min_hops(seeds_a, target_b, adj)
+    else:
+        results[(ca, cb)] = None
+
+n_reachable = sum(1 for d in results.values() if d is not None)
+plpy.notice(f'  {n_reachable}/{len(pairs)} pairs reachable')
+
+plpy.execute('DROP TABLE IF EXISTS _gdist_staging')
+plpy.execute('CREATE TEMP TABLE _gdist_staging (cluster_a int, cluster_b int, graph_distance real)')
+if results:
+    vals = ','.join(
+        f'({ca}, {cb}, {d})' if d is not None else f'({ca}, {cb}, NULL)'
+        for (ca, cb), d in results.items()
+    )
+    plpy.execute(f'INSERT INTO _gdist_staging VALUES {vals}')
+
+plpy.execute(f"""
+    UPDATE pipe_cluster_edges ce
+    SET graph_distance = s.graph_distance
+    FROM _gdist_staging s
+    WHERE ce.cluster_a    = s.cluster_a
+      AND ce.cluster_b    = s.cluster_b
+      AND ce.period_start = '{p_period_start}'
+      AND ce.corpus_id    = '{p_corpus_id}'
+""")
+
+elapsed = round(time.time() - t0, 3)
+return json.dumps({
+    'n_pairs':            len(pairs),
+    'n_reachable':        n_reachable,
+    'fraction_reachable': round(n_reachable / len(pairs), 3) if pairs else None,
+    'seconds':            elapsed,
+})
+
+
+=== compute_idea_lineage_depth ===
+
+import time
+import json
+from collections import defaultdict, deque
+
+t0 = time.time()
+
+period_sql = plpy.quote_literal(str(p_period_start))
+corpus_sql = plpy.quote_literal(p_corpus_id)
+
+# Load chunk info: cluster_id + is_boundary
+rv = plpy.execute("""
+    SELECT chunk_id, cluster_id, COALESCE(is_boundary, false) AS is_boundary
+    FROM chunk_periods
+    WHERE period_start = %s
+      AND corpus_id    = %s
+      AND cluster_id   IS NOT NULL
+""" % (period_sql, corpus_sql))
+
+chunk_cluster   = {}
+boundary_chunks = set()
+for row in rv:
+    cid = row['chunk_id']
+    chunk_cluster[cid] = row['cluster_id']
+    if row['is_boundary']:
+        boundary_chunks.add(cid)
+
+plpy.notice("compute_idea_lineage_depth: %d chunks, %d boundary seeds"
+            % (len(chunk_cluster), len(boundary_chunks)))
+
+# Build intra-cluster adjacency from knn_edges (undirected, same cluster only)
+adj = defaultdict(set)
+rv_edges = plpy.execute("""
+    SELECT chunk_id, neighbor_id
+    FROM knn_edges
+    WHERE period_start = %s AND corpus_id = %s
+""" % (period_sql, corpus_sql))
+
+for row in rv_edges:
+    a, b = row['chunk_id'], row['neighbor_id']
+    if chunk_cluster.get(a) == chunk_cluster.get(b):
+        adj[a].add(b)
+        adj[b].add(a)
+
+# Multi-source BFS from all boundary chunks
+# depth 1 = boundary chunk; increases with hops into cluster interior
+depth = {b: 1 for b in boundary_chunks if b in chunk_cluster}
+queue = deque((b, 1) for b in depth)
+
+while queue:
+    node, d = queue.popleft()
+    for nbr in adj.get(node, set()):
+        if nbr not in depth:
+            depth[nbr] = d + 1
+            queue.append((nbr, d + 1))
+
+# Isolated chunks (in a cluster but unreachable from any boundary) → depth 0
+n_isolated = 0
+for cid in chunk_cluster:
+    if cid not in depth:
+        depth[cid] = 0
+        n_isolated += 1
+
+n_assigned = len(depth)
+n_total    = len(chunk_cluster)
+plpy.notice("  depth assigned: %d/%d  isolated→0: %d"
+            % (n_assigned, n_total, n_isolated))
+
+# Batch write via temp staging table
+plpy.execute("DROP TABLE IF EXISTS _lineage_staging")
+plpy.execute("CREATE TEMP TABLE _lineage_staging (chunk_id text, depth int)")
+
+chunk_size = 2000
+items = list(depth.items())
+for i in range(0, len(items), chunk_size):
+    batch = items[i:i + chunk_size]
+    vals  = ','.join("('%s',%d)" % (cid.replace("'","''"), d) for cid, d in batch)
+    plpy.execute("INSERT INTO _lineage_staging VALUES " + vals)
+
+plpy.execute("""
+    UPDATE chunk_periods cp
+    SET idea_lineage_depth = s.depth
+    FROM _lineage_staging s
+    WHERE cp.chunk_id::text = s.chunk_id
+      AND cp.period_start   = %s
+      AND cp.corpus_id      = %s
+""" % (period_sql, corpus_sql))
+
+elapsed = round(time.time() - t0, 3)
+return json.dumps({
+    'n_chunks':         n_total,
+    'n_boundary_seeds': len(boundary_chunks),
+    'n_isolated':       n_isolated,
+    'n_assigned':       n_assigned,
+    'max_depth':        max((v for v in depth.values() if v > 0), default=0),
+    'seconds':          elapsed,
+})
+
+
+=== compute_intrinsic_dim ===
+
+import json
+import time
+import numpy as np
+
+t0 = time.time()
+
+MAX_CHUNKS = 500   # max chunks to score per period; subsample if larger (matches SVD guard)
+
+# ── Config ─────────────────────────────────────────────────────────────────────
+rv = plpy.execute("SELECT value FROM pipeline_config WHERE key = 'CURVATURE_K_NEIGHBORS'")
+k_nb = int(rv[0]['value']) if rv else 20
+
+rv = plpy.execute("SELECT value FROM pipeline_config WHERE key = 'CURVATURE_PCA_COMPONENTS'")
+k_pc = int(rv[0]['value']) if rv else 3
+
+plpy.notice(f"compute_intrinsic_dim: period={p_period_start} corpus={p_corpus_id} "
+            f"k_nb={k_nb} k_pc={k_pc}")
+
+# ── Fetch all embeddings needed: source chunks + their knn neighbours ──────────
+# Single UNION query — deduplicates chunks that appear in both sets.
+# embedding::float4[] comes back as a Python list via plpython3u type conversion.
+rv = plpy.execute(f"""
+    SELECT ch.chunk_id, ch.embedding::float4[] AS emb
+    FROM chunk_periods cp
+    JOIN data_chunks ch ON ch.chunk_id = cp.chunk_id
+    WHERE cp.period_start = '{p_period_start}'
+      AND cp.corpus_id    = '{p_corpus_id}'
+    UNION
+    SELECT ch.chunk_id, ch.embedding::float4[] AS emb
+    FROM knn_edges ke
+    JOIN data_chunks ch ON ch.chunk_id = ke.neighbor_id
+    WHERE ke.period_start = '{p_period_start}'
+      AND ke.corpus_id    = '{p_corpus_id}'
+""")
+
+emb_map = {}
+for row in rv:
+    emb_map[row['chunk_id']] = np.array(row['emb'], dtype=np.float32)
+
+plpy.notice(f"  {len(emb_map)} distinct embeddings loaded")
+
+# ── Fetch knn neighbour lists ──────────────────────────────────────────────────
+rv = plpy.execute(f"""
+    SELECT chunk_id::text, neighbor_id::text
+    FROM knn_edges
+    WHERE period_start = '{p_period_start}'
+      AND corpus_id    = '{p_corpus_id}'
+    ORDER BY chunk_id, rank
+""")
+knn_map = {}
+for row in rv:
+    knn_map.setdefault(row['chunk_id'], []).append(row['neighbor_id'])
+
+# ── Fetch all chunk_ids for this period ────────────────────────────────────────
+rv = plpy.execute(f"""
+    SELECT chunk_id::text
+    FROM chunk_periods
+    WHERE period_start = '{p_period_start}'
+      AND corpus_id    = '{p_corpus_id}'
+""")
+all_chunk_ids = [row['chunk_id'] for row in rv]
+plpy.notice(f"  {len(all_chunk_ids)} chunks to score")
+
+# ── Subsample if period is large ───────────────────────────────────────────────
+# Prevents OOM from BLAS thread-workspace pressure under concurrent workloads.
+# Unscored chunks receive intrinsic_dim=NULL (left unchanged / no UPDATE).
+# Same MAX_CHUNKS threshold as compute_svd_geometry MAX_SAMPLES.
+n_subsampled = 0
+if len(all_chunk_ids) > MAX_CHUNKS:
+    rng = np.random.default_rng(seed=42)
+    all_chunk_ids = list(rng.choice(all_chunk_ids, size=MAX_CHUNKS, replace=False))
+    n_subsampled  = len(all_chunk_ids)
+    plpy.notice(f"  subsampled to {MAX_CHUNKS} chunks (seed=42)")
+
+# ── SVD reconstruction error per chunk ────────────────────────────────────────
+idim = {}
+n_sparse = 0
+for cid in all_chunk_ids:
+    neighbors = knn_map.get(cid, [])[:k_nb]
+    nb_vecs   = [emb_map[nb] for nb in neighbors if nb in emb_map]
+    if len(nb_vecs) < 3:
+        idim[cid] = 0.0
+        n_sparse  += 1
+        continue
+    X        = np.array(nb_vecs, dtype=np.float64)
+    Xc       = X - X.mean(axis=0)
+    _, S, Vt = np.linalg.svd(Xc, full_matrices=False)
+    n_comp   = min(k_pc, len(nb_vecs) - 1)
+    recon    = (Xc @ Vt[:n_comp].T) @ Vt[:n_comp]
+    err      = float(np.mean((Xc - recon) ** 2))
+    expl     = float((S[:n_comp] ** 2).sum())
+    idim[cid] = err / (expl + 1e-10)
+
+plpy.notice(f"  scored {len(idim)} chunks ({n_sparse} sparse/zero)")
+
+# ── Write to chunk_periods.intrinsic_dim via staging table ────────────────────
+plpy.execute("DROP TABLE IF EXISTS _idim_staging")
+plpy.execute("CREATE TEMP TABLE _idim_staging (chunk_id text, intrinsic_dim real)")
+
+items      = list(idim.items())
+chunk_size = 2000
+for i in range(0, len(items), chunk_size):
+    batch  = items[i : i + chunk_size]
+    values = ','.join(f"('{cid}', {val:.10f})" for cid, val in batch)
+    plpy.execute(f"INSERT INTO _idim_staging VALUES {values}")
+
+plpy.execute(f"""
+    UPDATE chunk_periods cp
+    SET intrinsic_dim = s.intrinsic_dim
+    FROM _idim_staging s
+    WHERE cp.chunk_id::text = s.chunk_id
+      AND cp.period_start   = '{p_period_start}'
+      AND cp.corpus_id      = '{p_corpus_id}'
+""")
+
+# ── Aggregate to clusters.mean_intrinsic_dim ──────────────────────────────────
+plpy.execute(f"""
+    UPDATE clusters c
+    SET mean_intrinsic_dim = agg.mean_id
+    FROM (
+        SELECT cluster_id, AVG(intrinsic_dim) AS mean_id
+        FROM chunk_periods
+        WHERE period_start = '{p_period_start}'
+          AND corpus_id    = '{p_corpus_id}'
+          AND intrinsic_dim IS NOT NULL
+        GROUP BY cluster_id
+    ) agg
+    WHERE c.cluster_id   = agg.cluster_id
+      AND c.period_start = '{p_period_start}'
+      AND c.corpus_id    = '{p_corpus_id}'
+""")
+
+vals    = list(idim.values())
+elapsed = round(time.time() - t0, 3)
+plpy.notice(f"compute_intrinsic_dim: done in {elapsed}s")
+
+return json.dumps({
+    'n_chunks':          len(all_chunk_ids),
+    'n_subsampled':      n_subsampled,
+    'n_sparse':          n_sparse,
+    'max_intrinsic_dim': float(round(max(vals), 6)) if vals else 0.0,
+    'avg_intrinsic_dim': float(round(sum(vals) / len(vals), 6)) if vals else 0.0,
+    'p95_intrinsic_dim': float(round(float(np.percentile(vals, 95)), 6)) if vals else 0.0,
+    'seconds':           elapsed,
+})
+
+
+=== compute_marginal_entropy_impact ===
+
+import json
+import time
+import math
+import numpy as np
+
+t0 = time.time()
+period_sql = plpy.quote_literal(str(p_period_start))
+corpus_sql = plpy.quote_literal(p_corpus_id)
+
+N_BINS = 10
+SATURATED_DELTA = 0.01  # |delta| below this = semantically saturated
+
+rv_clusters = plpy.execute("""
+    SELECT cluster_id, distance_entropy, size
+    FROM clusters
+    WHERE period_start = %s
+      AND corpus_id    = %s
+      AND (is_junk IS NULL OR is_junk = FALSE)
+      AND distance_entropy IS NOT NULL
+""" % (period_sql, corpus_sql))
+
+if not rv_clusters:
+    return json.dumps({"n_updated": 0, "reason": "no clusters with distance_entropy"})
+
+def entropy_from_dists(d_list):
+    if len(d_list) < 2:
+        return 0.0
+    arr = np.array(d_list, dtype=np.float32)
+    max_val = max(float(arr.max()), 0.01)
+    bins = np.linspace(0.0, max_val, N_BINS + 1)
+    counts, _ = np.histogram(arr, bins=bins)
+    total = float(counts.sum())
+    if total == 0:
+        return 0.0
+    probs = counts / total
+    return float(-sum(p * math.log(p + 1e-12) for p in probs if p > 0))
+
+n_updated = 0
+
+for cl in rv_clusters:
+    cid             = cl['cluster_id']
+    current_entropy = cl['distance_entropy']
+
+    rv_dists = plpy.execute("""
+        SELECT distance_to_centroid AS d
+        FROM chunk_periods
+        WHERE period_start = %s
+          AND corpus_id    = %s
+          AND cluster_id   = %d
+          AND distance_to_centroid IS NOT NULL
+    """ % (period_sql, corpus_sql, cid))
+
+    dists = [r['d'] for r in rv_dists]
+    if len(dists) < 2:
+        continue
+
+    # Add hypothetical new chunk at centroid (distance = 0)
+    hyp_dists   = dists + [0.0]
+    hyp_entropy = entropy_from_dists(hyp_dists)
+    delta       = round(float(hyp_entropy - current_entropy), 6)
+
+    plpy.execute("""
+        UPDATE clusters
+        SET marginal_entropy_impact = %s
+        WHERE cluster_id   = %d
+          AND period_start = %s
+          AND corpus_id    = %s
+    """ % (delta, cid, period_sql, corpus_sql))
+
+    n_updated += 1
+
+elapsed = round(time.time() - t0, 2)
+plpy.notice("compute_marginal_entropy_impact: period=%s corpus=%s n_updated=%d elapsed=%.2fs"
+            % (p_period_start, p_corpus_id, n_updated, elapsed))
+
+return json.dumps({"n_updated": n_updated, "elapsed_s": elapsed})
+
+
+=== compute_shadow_clusters ===
+
+import json
+import time
+from collections import defaultdict, deque
+
+t0 = time.time()
+
+# Config
+rv = plpy.execute("SELECT value FROM pipeline_config WHERE key = 'SHADOW_MIN_CHUNKS'")
+min_chunks = int(rv[0]['value']) if rv else 5
+
+# Resolve period text label
+rv_p = plpy.execute("SELECT period_key, period_end FROM periods WHERE period_start = '%s'" % p_period_start)
+if not rv_p:
+    return json.dumps({'error': 'period not found', 'n_shadow': 0})
+period      = rv_p[0]['period_key']
+period_end  = rv_p[0]['period_end']
+
+# Fetch outlier chunk_ids for this period
+rv = plpy.execute("""
+    SELECT cp.chunk_id::text AS chunk_id
+    FROM chunk_periods cp
+    WHERE cp.period_start = '%s'
+      AND cp.corpus_id    = '%s'
+      AND cp.is_outlier   = TRUE
+      AND cp.cluster_id IS NOT NULL
+""" % (p_period_start, p_corpus_id))
+outlier_ids = {row['chunk_id'] for row in rv}
+plpy.notice("compute_shadow_clusters: %d outlier chunks" % len(outlier_ids))
+
+if len(outlier_ids) < min_chunks:
+    plpy.execute("""
+        UPDATE pipe_period_stats SET n_shadow_clusters = 0
+        WHERE period = '%s' AND corpus_id = '%s'
+    """ % (period, p_corpus_id))
+    return json.dumps({'n_shadow': 0, 'n_outliers': len(outlier_ids), 'elapsed_s': round(time.time()-t0,3)})
+
+# Build adjacency from knn_edges where both endpoints are outliers
+adj = defaultdict(set)
+rv = plpy.execute("""
+    SELECT chunk_id::text AS a, neighbor_id::text AS b
+    FROM knn_edges
+    WHERE period_start = '%s'
+      AND corpus_id    = '%s'
+""" % (p_period_start, p_corpus_id))
+for row in rv:
+    a, b = row['a'], row['b']
+    if a in outlier_ids and b in outlier_ids:
+        adj[a].add(b)
+        adj[b].add(a)
+
+# Connected components (BFS)
+visited = set()
+components = []
+for start in outlier_ids:
+    if start in visited:
+        continue
+    comp = []
+    queue = deque([start])
+    visited.add(start)
+    while queue:
+        node = queue.popleft()
+        comp.append(node)
+        for nb in adj.get(node, ()):
+            if nb not in visited:
+                visited.add(nb)
+                queue.append(nb)
+    if len(comp) >= min_chunks:
+        components.append(comp)
+
+plpy.notice("  %d components of size >= %d" % (len(components), min_chunks))
+
+if not components:
+    plpy.execute("""
+        UPDATE pipe_period_stats SET n_shadow_clusters = 0
+        WHERE period = '%s' AND corpus_id = '%s'
+    """ % (period, p_corpus_id))
+    return json.dumps({'n_shadow': 0, 'n_outliers': len(outlier_ids), 'elapsed_s': round(time.time()-t0,3)})
+
+# Fetch embeddings for all chunks in qualifying components
+import numpy as np
+comp_chunk_ids = [cid for comp in components for cid in comp]
+rv = plpy.execute("""
+    SELECT ch.chunk_id::text AS chunk_id, ch.embedding::float4[] AS emb
+    FROM data_chunks ch
+    WHERE ch.chunk_id::text = ANY(ARRAY[%s])
+      AND ch.embedding IS NOT NULL
+""" % ("'" + "','".join(comp_chunk_ids) + "'"))
+emb_map = {row['chunk_id']: np.array(row['emb'], dtype=np.float32) for row in rv}
+
+# Fetch distance_to_centroid for density proxy
+rv = plpy.execute("""
+    SELECT cp.chunk_id::text AS chunk_id, cp.distance_to_centroid
+    FROM chunk_periods cp
+    WHERE cp.period_start = '%s'
+      AND cp.corpus_id    = '%s'
+      AND cp.chunk_id::text = ANY(ARRAY[%s])
+""" % (p_period_start, p_corpus_id, "'" + "','".join(comp_chunk_ids) + "'"))
+dist_map = {row['chunk_id']: row['distance_to_centroid'] for row in rv}
+
+# Fetch formal cluster centroids for nearest-cluster lookup
+rv = plpy.execute("""
+    SELECT cluster_id, centroid::float4[] AS centroid
+    FROM clusters
+    WHERE period    = '%s'
+      AND corpus_id = '%s'
+      AND is_junk   = FALSE
+      AND centroid  IS NOT NULL
+""" % (period, p_corpus_id))
+formal_clusters = {row['cluster_id']: np.array(row['centroid'], dtype=np.float32) for row in rv}
+
+def cosine_dist(a, b):
+    na = np.linalg.norm(a)
+    nb = np.linalg.norm(b)
+    if na < 1e-10 or nb < 1e-10:
+        return 1.0
+    return float(1.0 - np.dot(a, b) / (na * nb))
+
+# Clear existing shadow clusters for this period
+plpy.execute("""
+    DELETE FROM shadow_clusters
+    WHERE period_start = '%s' AND corpus_id = '%s'
+""" % (p_period_start, p_corpus_id))
+
+n_written = 0
+for comp in components:
+    vecs = [emb_map[cid] for cid in comp if cid in emb_map]
+    if len(vecs) < min_chunks:
+        continue
+
+    mat = np.array(vecs, dtype=np.float64)
+    centroid = mat.mean(axis=0).astype(np.float32)
+
+    # Mean density: mean distance_to_centroid of members (proxy for compactness)
+    dists = [dist_map[cid] for cid in comp if dist_map.get(cid) is not None]
+    mean_density = float(np.mean(dists)) if dists else 0.0
+
+    # Find nearest formal cluster
+    nearest_cluster = None
+    nearest_dist    = float('inf')
+    for fc_id, fc_centroid in formal_clusters.items():
+        d = cosine_dist(centroid, fc_centroid)
+        if d < nearest_dist:
+            nearest_dist    = d
+            nearest_cluster = fc_id
+
+    if nearest_cluster is None:
+        continue
+
+    # Serialize centroid as pgvector literal
+    cent_str = '[' + ','.join('%.8f' % x for x in centroid) + ']'
+
+    plpy.execute("""
+        INSERT INTO shadow_clusters
+            (corpus_id, centroid, n_chunks, mean_density,
+             nearest_cluster, distance_to_nearest,
+             period_start, period_end)
+        VALUES ('%s', '%s'::vector, %d, %s, %d, %s, '%s', '%s')
+        ON CONFLICT (corpus_id, nearest_cluster, period_start) DO UPDATE SET
+            centroid            = EXCLUDED.centroid,
+            n_chunks            = EXCLUDED.n_chunks,
+            mean_density        = EXCLUDED.mean_density,
+            distance_to_nearest = EXCLUDED.distance_to_nearest
+    """ % (p_corpus_id, cent_str, len(vecs), mean_density,
+           nearest_cluster, nearest_dist,
+           p_period_start, period_end))
+    n_written += 1
+
+# Update pipe_period_stats
+plpy.execute("""
+    UPDATE pipe_period_stats SET n_shadow_clusters = %d
+    WHERE period = '%s' AND corpus_id = '%s'
+""" % (n_written, period, p_corpus_id))
+
+elapsed = round(time.time() - t0, 3)
+plpy.notice("  wrote %d shadow clusters in %.3fs" % (n_written, elapsed))
+
+return json.dumps({
+    'n_shadow':   n_written,
+    'n_outliers': len(outlier_ids),
+    'n_comps':    len(components),
+    'elapsed_s':  elapsed,
+})
+
+
+=== compute_spectral_geometry ===
+
+import numpy as np
+from scipy.sparse import lil_matrix
+from scipy.sparse.linalg import eigsh
+
+_REAL_MIN = 1.175494e-38  # PostgreSQL real minimum positive normal
+
+# ── Config ───────────────────────────────────────────────────────────────────────
+rv = plpy.execute("SELECT value FROM pipeline_config WHERE key = 'SPECTRAL_MAX_EIGENVALUES'")
+k_eig_max = int(rv[0]['value']) if rv else 30
+
+rv = plpy.execute("SELECT value FROM pipeline_config WHERE key = 'SPECTRAL_ZERO_THRESHOLD'")
+zero_thresh = float(rv[0]['value']) if rv else 1e-6
+
+# ── Fetch cluster edges ──────────────────────────────────────────────────────────
+# Use cluster-level graph (20-100 nodes) instead of kNN chunk graph (thousands).
+rv = plpy.execute(f"""
+    SELECT cluster_a, cluster_b, COALESCE(connection_weight, 1.0) AS w
+    FROM pipe_cluster_edges
+    WHERE period_start = '{p_period_start}'
+      AND corpus_id    = '{p_corpus_id}'
+""")
+
+nodes = set()
+edges = []
+for row in rv:
+    a, b, w = int(row['cluster_a']), int(row['cluster_b']), float(row['w'])
+    nodes.add(a)
+    nodes.add(b)
+    edges.append((a, b, max(w, 0.0)))
+
+n = len(nodes)
+if n < 2:
+    plpy.notice(f"compute_spectral_geometry: only {n} nodes for corpus={p_corpus_id} "
+                f"period={p_period_start}, skipping")
+    return
+
+# ── Build sparse Laplacian ────────────────────────────────────────────────────────
+node_list = sorted(nodes)
+idx = {nid: i for i, nid in enumerate(node_list)}
+
+L = lil_matrix((n, n), dtype=np.float64)
+for a, b, w in edges:
+    i, j = idx[a], idx[b]
+    L[i, j] -= w
+    L[j, i] -= w
+    L[i, i] += w
+    L[j, j] += w
+
+L_csr = L.tocsr()
+
+# ── Compute eigenvalues ───────────────────────────────────────────────────────────
+# For small matrices (n <= 50) or when k_eig >= n//2, ARPACK eigsh is unreliable
+# (designed for large sparse matrices; degrades when k approaches n).
+# Use numpy dense eigvalsh for small matrices — it's faster anyway at this scale.
+k_eig = min(k_eig_max, max(n // 2, 2))
+use_dense = (n <= 50)
+
+if use_dense:
+    evals = sorted(np.linalg.eigvalsh(L_csr.toarray()))
+else:
+    try:
+        evals = eigsh(L_csr, k=k_eig, which='SM', return_eigenvectors=False)
+        evals = sorted(np.real(evals))
+    except Exception as exc:
+        plpy.notice(f"compute_spectral_geometry: eigsh failed ({exc}), falling back to dense")
+        evals = sorted(np.linalg.eigvalsh(L_csr.toarray()))
+
+alg_conn = float(evals[1]) if len(evals) > 1 else 0.0
+spec_gap  = float(evals[2] - evals[1]) if len(evals) > 2 else 0.0
+
+# n_communities: for disconnected graphs (alg_conn == 0), the multiplicity of
+# the zero eigenvalue equals the number of connected components.
+# For connected graphs, find the largest spectral gap.
+n_zero = sum(1 for e in evals if e < zero_thresh)
+if n_zero > 1:
+    # Disconnected graph: number of components = number of zero eigenvalues
+    n_comm = n_zero
+else:
+    # Connected graph: largest gap in non-zero eigenvalues
+    first_nz = next((i for i, e in enumerate(evals) if e > zero_thresh), len(evals) - 1)
+    gaps = np.diff(evals[first_nz:])
+    n_comm = (int(np.argmax(gaps)) + first_nz + 1) if len(gaps) > 0 else 1
+n_comm = max(1, n_comm)
+
+# Flush subnormal floats (PostgreSQL real rejects abs < 1.175494e-38)
+if abs(alg_conn) < _REAL_MIN:
+    alg_conn = 0.0
+if abs(spec_gap) < _REAL_MIN:
+    spec_gap = 0.0
+
+# ── Write to pipe_period_stats ────────────────────────────────────────────────────
+plpy.execute(f"""
+    UPDATE pipe_period_stats
+    SET algebraic_connectivity  = {alg_conn},
+        spectral_gap             = {spec_gap},
+        n_communities_spectral   = {n_comm}
+    WHERE period_start = '{p_period_start}'
+      AND corpus_id    = '{p_corpus_id}'
+""")
+
+plpy.notice(f"compute_spectral_geometry: n_nodes={n} n_edges={len(edges)} "
+            f"alg_conn={alg_conn:.4f} spectral_gap={spec_gap:.4f} n_comm={n_comm} "
+            f"corpus={p_corpus_id} period={p_period_start}")
+
+
+=== compute_svd_geometry ===
+
+import json
+import numpy as np
+from collections import defaultdict
+
+_REAL_MIN   = 1.175494e-38   # PostgreSQL real minimum (flush subnormals to 0)
+MAX_SAMPLES = 500            # max chunks per cluster for SVD; subsample if larger
+
+def safe_real(v):
+    if v is None:
+        return None
+    f = float(v)
+    if abs(f) < _REAL_MIN:
+        return 0.0
+    return f
+
+def parse_vec(raw):
+    """Parse pgvector text representation '[v1,v2,...,vn]' into a numpy array."""
+    if isinstance(raw, (list, tuple)):
+        return np.array(raw, dtype=np.float64)
+    s = str(raw).strip()
+    if s.startswith('{'):
+        s = '[' + s[1:-1] + ']'
+    return np.array(json.loads(s), dtype=np.float64)
+
+# ── 1. Fetch all embeddings for the period in a single query ─────────────────
+rv = plpy.execute(f"""
+    SELECT cp.cluster_id,
+           ch.embedding::text AS emb
+    FROM chunk_periods cp
+    JOIN data_chunks ch ON ch.chunk_id = cp.chunk_id
+    WHERE cp.period_start = '{p_period_start}'
+      AND cp.corpus_id    = '{p_corpus_id}'
+      AND cp.cluster_id   IS NOT NULL
+      AND ch.embedding    IS NOT NULL
+""")
+
+cluster_embs = defaultdict(list)
+for row in rv:
+    cid = row['cluster_id']
+    try:
+        vec = parse_vec(row['emb'])
+        if vec.shape[0] > 0:
+            cluster_embs[cid].append(vec)
+    except Exception:
+        pass   # malformed embedding: skip silently
+
+# ── 2. Get non-junk cluster_ids for this period ───────────────────────────────
+cluster_rv = plpy.execute(f"""
+    SELECT cluster_id
+    FROM pipe_clusters
+    WHERE period_start = '{p_period_start}'
+      AND corpus_id    = '{p_corpus_id}'
+      AND (is_junk IS DISTINCT FROM TRUE)
+""")
+non_junk_ids = [row['cluster_id'] for row in cluster_rv]
+
+if not non_junk_ids:
+    plpy.notice(f"compute_svd_geometry: no non-junk clusters for {p_corpus_id} {p_period_start}")
+    return
+
+# ── 3. Prepare UPDATE plan ────────────────────────────────────────────────────
+plan = plpy.prepare("""
+    UPDATE pipe_clusters
+    SET spread             = $1,
+        cohesion           = $2,
+        elongation_ratio   = $3,
+        mean_intrinsic_dim = $4
+    WHERE cluster_id   = $5
+      AND period_start = $6
+      AND corpus_id    = $7
+""", ["real", "real", "real", "real", "integer", "date", "text"])
+
+n_updated   = 0
+n_edge      = 0
+n_sampled   = 0  # clusters where subsampling was applied
+
+rng = np.random.default_rng(seed=42)  # deterministic subsampling
+
+for cluster_id in non_junk_ids:
+    vecs = cluster_embs.get(cluster_id, [])
+    n    = len(vecs)
+
+    if n < 2:
+        spread    = 0.0
+        cohesion  = 1.0
+        elong     = 1.0
+        idim      = 1.0
+        n_edge   += 1
+    else:
+        try:
+            # Subsample if too many chunks — keeps SVD tractable
+            if n > MAX_SAMPLES:
+                idx  = rng.choice(n, size=MAX_SAMPLES, replace=False)
+                vecs = [vecs[i] for i in idx]
+                n_sampled += 1
+
+            X  = np.stack(vecs, axis=0)   # shape: (min(n, MAX_SAMPLES), 1024)
+            Xc = X - X.mean(axis=0)       # centre
+
+            # full_matrices=False → S shape: (min(n, 1024),)
+            _, S, _ = np.linalg.svd(Xc, full_matrices=False)
+
+            s_sum = float(S.sum())
+            s0    = float(S[0]) if len(S) > 0 else 0.0
+
+            spread   = s0
+            cohesion = float(1.0 - s0 / s_sum) if s_sum > 0.0 else 1.0
+
+            if len(S) > 1 and float(S[1]) > 0.0:
+                elong = float(S[0] / S[1])
+            else:
+                elong = 1.0
+
+            threshold = s0 * 0.01
+            idim = float(int(np.sum(S > threshold)))
+
+        except np.linalg.LinAlgError as e:
+            plpy.warning(f"compute_svd_geometry: SVD failed cluster {cluster_id}: {e}")
+            spread = 0.0; cohesion = 1.0; elong = 1.0; idim = 1.0
+            n_edge += 1
+
+    plpy.execute(plan, [
+        safe_real(spread),
+        safe_real(cohesion),
+        safe_real(elong),
+        safe_real(idim),
+        cluster_id,
+        p_period_start,
+        p_corpus_id,
+    ])
+    n_updated += 1
+
+plpy.notice(
+    f"compute_svd_geometry: {n_updated} clusters updated "
+    f"({n_edge} edge-case, {n_sampled} subsampled@{MAX_SAMPLES}), "
+    f"corpus={p_corpus_id} period={p_period_start}"
+)
+
+
+=== compute_system_entropy ===
+
+import json
+import time
+import numpy as np
+
+t0 = time.time()
+
+# ── Config ─────────────────────────────────────────────────────────────────────
+rv = plpy.execute("SELECT value FROM pipeline_config WHERE key = 'ENTROPY_TOP_DIMS'")
+top_dims = int(rv[0]['value']) if rv else 10
+
+rv = plpy.execute("SELECT value FROM pipeline_config WHERE key = 'ENTROPY_BINS'")
+ent_bins = int(rv[0]['value']) if rv else 50
+
+plpy.notice(f"compute_system_entropy: period={p_period_start} corpus={p_corpus_id} "
+            f"top_dims={top_dims} bins={ent_bins}")
+
+# ── Fetch all chunk embeddings for the period ─────────────────────────────────
+rv = plpy.execute(f"""
+    SELECT ch.embedding::float4[] AS emb
+    FROM chunk_periods cp
+    JOIN data_chunks ch ON ch.chunk_id = cp.chunk_id
+    WHERE cp.period_start = '{p_period_start}'
+      AND cp.corpus_id    = '{p_corpus_id}'
+""")
+
+if not rv:
+    plpy.notice("  No embeddings — skipping")
+    return json.dumps({'n_chunks': 0, 'system_entropy': None, 'seconds': 0.0})
+
+E = np.array([row['emb'] for row in rv], dtype=np.float64)
+n_chunks, n_dims = E.shape
+plpy.notice(f"  {n_chunks} chunks × {n_dims} dims")
+
+# ── Top-k variance dimensions → per-dimension Shannon entropy ─────────────────
+dim_var  = E.var(axis=0)
+top_idx  = np.argsort(dim_var)[-(top_dims):][::-1]
+entropies = []
+for dim in top_idx:
+    hist, _ = np.histogram(E[:, dim], bins=ent_bins)
+    total   = hist.sum()
+    if total == 0:
+        continue
+    probs = hist / total
+    mask  = probs > 0
+    entropies.append(float(-np.sum(probs[mask] * np.log(probs[mask]))))
+
+system_entropy = float(np.mean(entropies)) if entropies else 0.0
+plpy.notice(f"  system_entropy = {system_entropy:.4f} (over {len(entropies)} dims)")
+
+# ── Write to pipe_period_stats ──────────────────────────────────────────────────────
+# UPDATE first (row should already exist from populate_period_stats).
+# If not, INSERT with period_end derived from chunk_periods.
+plpy.execute(f"""
+    UPDATE pipe_period_stats
+    SET system_entropy = {system_entropy}
+    WHERE period_start = '{p_period_start}'
+      AND corpus_id    = '{p_corpus_id}'
+""")
+
+rv2 = plpy.execute(f"""
+    SELECT COUNT(*) AS c FROM pipe_period_stats
+    WHERE period_start = '{p_period_start}'
+      AND corpus_id    = '{p_corpus_id}'
+""")
+if rv2[0]['c'] == 0:
+    plpy.execute(f"""
+        INSERT INTO pipe_period_stats (period_start, period_end, corpus_id, system_entropy)
+        SELECT '{p_period_start}',
+               MAX(period_end),
+               '{p_corpus_id}',
+               {system_entropy}
+        FROM chunk_periods
+        WHERE period_start = '{p_period_start}'
+          AND corpus_id    = '{p_corpus_id}'
+        ON CONFLICT (period_start, corpus_id)
+        DO UPDATE SET system_entropy = EXCLUDED.system_entropy
+    """)
+
+elapsed = round(time.time() - t0, 3)
+plpy.notice(f"compute_system_entropy: done in {elapsed}s")
+
+return json.dumps({
+    'n_chunks':       n_chunks,
+    'system_entropy': round(system_entropy, 4),
+    'n_dims_used':    len(entropies),
+    'seconds':        elapsed,
+})
+
+
+=== compute_velocity_direction_stability ===
+
+import json
+import time
+import numpy as np
+
+t0 = time.time()
+
+rv = plpy.execute(
+    "SELECT value::int AS v FROM pipeline_config "
+    "WHERE key IN ('VELOCITY_STABILITY_WINDOW','STABILITY_WINDOW') "
+    "ORDER BY key LIMIT 1"
+)
+window = rv[0]['v'] if rv else 4
+
+period_sql = plpy.quote_literal(str(p_period_start))
+corpus_sql = plpy.quote_literal(p_corpus_id)
+
+curr = plpy.execute(f"""
+    SELECT cluster_id, persistent_cluster_id
+    FROM clusters
+    WHERE period_start = {period_sql}
+      AND corpus_id    = {corpus_sql}
+      AND persistent_cluster_id IS NOT NULL
+      AND centroid IS NOT NULL
+      AND (is_junk IS NULL OR is_junk = FALSE)
+""")
+if not curr:
+    return json.dumps({'n_updated': 0, 'elapsed_s': round(time.time()-t0, 2)})
+
+def unit(v):
+    n = float(np.linalg.norm(v))
+    return v / max(n, 1e-9)
+
+n_updated = 0
+for row in curr:
+    cid  = row['cluster_id']
+    pcid = row['persistent_cluster_id']
+    qpcid = plpy.quote_literal(pcid)
+
+    history = plpy.execute(f"""
+        SELECT period_start, centroid::float4[] AS c
+        FROM clusters
+        WHERE corpus_id             = {corpus_sql}
+          AND persistent_cluster_id = {qpcid}
+          AND period_start         <= {period_sql}
+          AND centroid IS NOT NULL
+        ORDER BY period_start DESC
+        LIMIT {window + 1}
+    """)
+    if len(history) < 2:
+        continue
+
+    history = list(reversed(history))
+    centroids = [np.array(h['c'], dtype=np.float32) for h in history]
+    normed    = [unit(c) for c in centroids]
+    deltas    = [normed[i+1] - normed[i] for i in range(len(normed)-1)]
+
+    if len(deltas) < 2:
+        stability = 1.0
+    else:
+        sims = []
+        for i in range(len(deltas)-1):
+            d1 = unit(deltas[i])
+            d2 = unit(deltas[i+1])
+            sims.append(float(np.dot(d1, d2)))
+        stability = float(np.mean(sims))
+
+    plpy.execute(f"""
+        UPDATE clusters
+        SET velocity_direction_stability = {stability:.6f}
+        WHERE period_start = {period_sql}
+          AND corpus_id    = {corpus_sql}
+          AND cluster_id   = {cid}
+    """)
+    n_updated += 1
+
+elapsed = round(time.time()-t0, 2)
+plpy.notice(f"compute_velocity_direction_stability: {n_updated} updated {elapsed}s")
+return json.dumps({'n_updated': n_updated, 'elapsed_s': elapsed})
+
+
+=== compute_void_count ===
+
+import json
+import time
+import numpy as np
+
+t0 = time.time()
+
+# ── Read config ───────────────────────────────────────────────────────────────
+rv = plpy.execute("SELECT key, value FROM pipeline_config "
+                  "WHERE key IN ('VOID_PAIR_THRESHOLD','VOID_MIDPOINT_RADIUS')")
+cfg = {r['key']: float(r['value']) for r in rv}
+pair_thresh = cfg.get('VOID_PAIR_THRESHOLD',  0.3)
+mid_thresh  = cfg.get('VOID_MIDPOINT_RADIUS', 0.15)
+
+period_sql = plpy.quote_literal(str(p_period_start))
+corpus_sql = plpy.quote_literal(p_corpus_id)
+
+# ── Fetch cluster centroids (non-junk only) ───────────────────────────────────
+rv = plpy.execute(f"""
+    SELECT cluster_id, centroid::float4[] AS c
+    FROM clusters
+    WHERE period_start = {period_sql}
+      AND corpus_id    = {corpus_sql}
+      AND centroid IS NOT NULL
+      AND (is_junk IS NULL OR is_junk = FALSE)
+""")
+
+n = len(rv)
+plpy.notice(f"compute_void_count: period={p_period_start} corpus={p_corpus_id} "
+            f"clusters={n} pair_thresh={pair_thresh} mid_thresh={mid_thresh}")
+
+def _write(void_count, n_chunks=0, n_pairs=0):
+    plpy.execute(f"""
+        UPDATE pipe_period_stats
+        SET void_count = {void_count}
+        WHERE period_start = {period_sql} AND corpus_id = {corpus_sql}
+    """)
+    elapsed = round(time.time() - t0, 2)
+    plpy.notice(f"compute_void_count: void_count={void_count} "
+                f"n_pairs={n_pairs} n_chunks={n_chunks} elapsed={elapsed}s")
+    return json.dumps({
+        "void_count":      void_count,
+        "n_clusters":      n,
+        "n_chunks":        n_chunks,
+        "n_pairs_checked": n_pairs,
+        "elapsed_s":       elapsed,
+    })
+
+if n < 2:
+    return _write(0)
+
+# ── Build L2-normalised centroid matrix ───────────────────────────────────────
+C = np.array([row['c'] for row in rv], dtype=np.float32)   # (n, 1024)
+norms = np.linalg.norm(C, axis=1, keepdims=True)
+norms = np.where(norms < 1e-9, 1e-9, norms)
+C_norm = C / norms                                          # unit vectors
+
+# ── Pairwise cosine distances ─────────────────────────────────────────────────
+sim = C_norm @ C_norm.T         # (n, n)  symmetric, diag=1
+dist = 1.0 - sim                # cosine distance
+
+# Upper-triangle pairs exceeding threshold
+i_idx, j_idx = np.where(np.triu(dist > pair_thresh, k=1))
+candidate_pairs = list(zip(i_idx.tolist(), j_idx.tolist()))
+n_pairs = len(candidate_pairs)
+
+plpy.notice(f"compute_void_count: {n_pairs} candidate pairs with dist>{pair_thresh}")
+
+if n_pairs == 0:
+    return _write(0)
+
+# ── Fetch chunk embeddings for this period/corpus ─────────────────────────────
+rv2 = plpy.execute(f"""
+    SELECT ch.embedding::float4[] AS e
+    FROM chunk_periods cp
+    JOIN data_chunks ch ON ch.chunk_id = cp.chunk_id
+    WHERE cp.period_start = {period_sql}
+      AND cp.corpus_id    = {corpus_sql}
+      AND ch.embedding IS NOT NULL
+""")
+n_chunks = len(rv2)
+
+if n_chunks == 0:
+    # No embeddings → every gap is a void by default
+    return _write(n_pairs, n_chunks=0, n_pairs=n_pairs)
+
+E = np.array([row['e'] for row in rv2], dtype=np.float32)  # (n_chunks, 1024)
+e_norms = np.linalg.norm(E, axis=1, keepdims=True)
+e_norms = np.where(e_norms < 1e-9, 1e-9, e_norms)
+E_norm = E / e_norms                                        # unit chunk vectors
+
+# ── Count pipe_voids ───────────────────────────────────────────────────────────────
+void_count = 0
+for i, j in candidate_pairs:
+    # Midpoint of two unit vectors, then re-normalise
+    mid = C_norm[i] + C_norm[j]                 # (1024,)
+    mid_len = float(np.linalg.norm(mid))
+    if mid_len < 1e-9:
+        # Antipodal centroids — gap is certainly empty
+        void_count += 1
+        continue
+    mid_unit = (mid / mid_len).astype(np.float32)
+
+    # Max cosine similarity between midpoint and any chunk
+    # = dot product (both unit-normalised)
+    max_sim = float(E_norm @ mid_unit).max() if n_chunks == 1 \
+              else float((E_norm @ mid_unit).max())
+    min_dist_to_mid = 1.0 - max_sim
+
+    if min_dist_to_mid > mid_thresh:
+        void_count += 1
+
+return _write(void_count, n_chunks=n_chunks, n_pairs=n_pairs)
+
+
+=== compute_void_density ===
+
+import json
+import time
+import numpy as np
+
+t0 = time.time()
+
+rv = plpy.execute(
+    "SELECT key, value FROM pipeline_config "
+    "WHERE key IN ('VOID_DISTANCE_THRESHOLD','VOID_PAIR_THRESHOLD','VOID_MIDPOINT_RADIUS')"
+)
+cfg = {r['key']: float(r['value']) for r in rv}
+pair_thresh = cfg.get('VOID_DISTANCE_THRESHOLD', cfg.get('VOID_PAIR_THRESHOLD', 0.3))
+mid_thresh  = cfg.get('VOID_MIDPOINT_RADIUS', 0.15)
+
+period_sql = plpy.quote_literal(str(p_period_start))
+corpus_sql = plpy.quote_literal(p_corpus_id)
+
+rv = plpy.execute(f"""
+    SELECT cluster_id, centroid::float4[] AS c
+    FROM clusters
+    WHERE period_start = {period_sql}
+      AND corpus_id    = {corpus_sql}
+      AND centroid IS NOT NULL
+      AND (is_junk IS NULL OR is_junk = FALSE)
+""")
+if not rv:
+    return json.dumps({'n_edges_updated': 0, 'elapsed_s': round(time.time()-t0, 2)})
+
+def unit(v):
+    n = float(np.linalg.norm(v))
+    return v / max(n, 1e-9)
+
+centroid_map = {r['cluster_id']: np.array(r['c'], dtype=np.float32) for r in rv}
+
+edges = plpy.execute(f"""
+    SELECT cluster_a, cluster_b
+    FROM pipe_cluster_edges
+    WHERE period_start = {period_sql}
+      AND corpus_id    = {corpus_sql}
+""")
+if not edges:
+    return json.dumps({'n_edges_updated': 0, 'elapsed_s': round(time.time()-t0, 2)})
+
+rv2 = plpy.execute(f"""
+    SELECT ch.embedding::float4[] AS e
+    FROM chunk_periods cp
+    JOIN data_chunks ch ON ch.chunk_id = cp.chunk_id
+    WHERE cp.period_start  = {period_sql}
+      AND cp.corpus_id     = {corpus_sql}
+      AND cp.is_dark_matter = TRUE
+      AND ch.embedding IS NOT NULL
+""")
+n_dm = len(rv2)
+DM_norm = None
+if n_dm > 0:
+    DM = np.array([r['e'] for r in rv2], dtype=np.float32)
+    dm_norms = np.linalg.norm(DM, axis=1, keepdims=True)
+    dm_norms = np.where(dm_norms < 1e-9, 1e-9, dm_norms)
+    DM_norm = DM / dm_norms
+
+n_updated = 0
+for edge in edges:
+    ca, cb = edge['cluster_a'], edge['cluster_b']
+    if ca not in centroid_map or cb not in centroid_map:
+        continue
+    va = unit(centroid_map[ca])
+    vb = unit(centroid_map[cb])
+    cosine_dist = float(1.0 - np.dot(va, vb))
+    if cosine_dist <= pair_thresh:
+        plpy.execute(f"""
+            UPDATE pipe_cluster_edges
+            SET void_dark_matter_count = 0, void_density = 0.0
+            WHERE period_start = {period_sql} AND corpus_id = {corpus_sql}
+              AND cluster_a = {ca} AND cluster_b = {cb}
+        """)
+        continue
+    dm_count = 0
+    if DM_norm is not None:
+        mid_unit = unit(va + vb)
+        sims = DM_norm @ mid_unit.astype(np.float32)
+        dm_count = int(np.sum(1.0 - sims <= mid_thresh))
+    density = dm_count / max(cosine_dist, 1e-6)
+    plpy.execute(f"""
+        UPDATE pipe_cluster_edges
+        SET void_dark_matter_count = {dm_count},
+            void_density           = {density:.6f}
+        WHERE period_start = {period_sql} AND corpus_id = {corpus_sql}
+          AND cluster_a = {ca} AND cluster_b = {cb}
+    """)
+    n_updated += 1
+
+return json.dumps({'n_edges_updated': n_updated, 'n_dark_matter_chunks': n_dm,
+                   'elapsed_s': round(time.time()-t0, 2)})
+
+
+=== compute_void_persistence ===
+
+import json
+import time
+import numpy as np
+
+t0 = time.time()
+
+rv = plpy.execute(
+    "SELECT key, value FROM pipeline_config "
+    "WHERE key IN ('VOID_DISTANCE_THRESHOLD','VOID_PAIR_THRESHOLD','VOID_MIDPOINT_RADIUS')"
+)
+cfg = {r['key']: float(r['value']) for r in rv}
+pair_thresh = cfg.get('VOID_DISTANCE_THRESHOLD', cfg.get('VOID_PAIR_THRESHOLD', 0.3))
+mid_thresh  = cfg.get('VOID_MIDPOINT_RADIUS', 0.15)
+
+period_sql = plpy.quote_literal(str(p_period_start))
+corpus_sql = plpy.quote_literal(p_corpus_id)
+
+rv = plpy.execute(f"""
+    SELECT cluster_id, persistent_cluster_id, centroid::float4[] AS c
+    FROM clusters
+    WHERE period_start = {period_sql}
+      AND corpus_id    = {corpus_sql}
+      AND centroid IS NOT NULL
+      AND (is_junk IS NULL OR is_junk = FALSE)
+""")
+
+if len(rv) < 2:
+    plpy.execute(f"""
+        UPDATE pipe_period_stats SET max_void_persistence = 0
+        WHERE period_start = {period_sql} AND corpus_id = {corpus_sql}
+    """)
+    return json.dumps({'n_voids': 0, 'max_persistence': 0,
+                       'elapsed_s': round(time.time()-t0, 2)})
+
+pcids = [r['persistent_cluster_id'] for r in rv]
+C = np.array([r['c'] for r in rv], dtype=np.float32)
+norms = np.linalg.norm(C, axis=1, keepdims=True)
+norms = np.where(norms < 1e-9, 1e-9, norms)
+C_norm = C / norms
+
+sim  = C_norm @ C_norm.T
+dist = 1.0 - sim
+i_idx, j_idx = np.where(np.triu(dist > pair_thresh, k=1))
+candidate_pairs = list(zip(i_idx.tolist(), j_idx.tolist()))
+
+if not candidate_pairs:
+    plpy.execute(f"""
+        UPDATE pipe_voids SET status = 'inactive'
+        WHERE corpus_id = {corpus_sql} AND status = 'active';
+        UPDATE pipe_period_stats SET max_void_persistence = 0
+        WHERE period_start = {period_sql} AND corpus_id = {corpus_sql}
+    """)
+    return json.dumps({'n_voids': 0, 'max_persistence': 0,
+                       'elapsed_s': round(time.time()-t0, 2)})
+
+rv2 = plpy.execute(f"""
+    SELECT ch.embedding::float4[] AS e
+    FROM chunk_periods cp
+    JOIN data_chunks ch ON ch.chunk_id = cp.chunk_id
+    WHERE cp.period_start = {period_sql}
+      AND cp.corpus_id    = {corpus_sql}
+      AND ch.embedding IS NOT NULL
+""")
+n_chunks = len(rv2)
+E_norm = None
+if n_chunks > 0:
+    E = np.array([r['e'] for r in rv2], dtype=np.float32)
+    e_norms = np.linalg.norm(E, axis=1, keepdims=True)
+    e_norms = np.where(e_norms < 1e-9, 1e-9, e_norms)
+    E_norm = E / e_norms
+
+void_pairs = []
+for i, j in candidate_pairs:
+    if E_norm is None:
+        is_void = True
+    else:
+        mid = C_norm[i] + C_norm[j]
+        mid_len = float(np.linalg.norm(mid))
+        if mid_len < 1e-9:
+            is_void = True
+        else:
+            mid_unit = (mid / mid_len).astype(np.float32)
+            max_sim = float((E_norm @ mid_unit).max())
+            is_void = (1.0 - max_sim) > mid_thresh
+    if is_void:
+        pa = pcids[i] or ''
+        pb = pcids[j] or ''
+        if pa and pb:
+            a, b = (pa, pb) if pa < pb else (pb, pa)
+            void_pairs.append((a, b))
+
+n_voids = len(void_pairs)
+plpy.notice(f"compute_void_persistence: {n_voids} void pairs period={p_period_start}")
+
+period_str = plpy.quote_literal(str(p_period_start))
+for pa, pb in void_pairs:
+    qa, qb = plpy.quote_literal(pa), plpy.quote_literal(pb)
+    # C-06 FIX: ON CONFLICT now targets the unconditional unique index
+    # `pipe_voids_pair_unique` (corpus_id, persistent_cluster_a, persistent_cluster_b).
+    # Previously targeted the partial index `voids_active_pair_idx` (WHERE status='active'),
+    # which caused a unique violation when an inactive void re-emerged because the
+    # unconditional index `pipe_voids_pair_unique` fired first.
+    # The DO UPDATE now handles void re-emergence by resetting period_count when
+    # transitioning from inactive→active.
+    plpy.execute(f"""
+        INSERT INTO pipe_voids
+            (corpus_id, persistent_cluster_a, persistent_cluster_b,
+             first_seen, last_seen, period_count, status)
+        VALUES
+            ({corpus_sql}, {qa}, {qb},
+             {period_str}, {period_str}, 1, 'active')
+        ON CONFLICT (corpus_id, persistent_cluster_a, persistent_cluster_b)
+        DO UPDATE SET
+            last_seen    = EXCLUDED.last_seen,
+            period_count = CASE
+                WHEN pipe_voids.status = 'active' THEN pipe_voids.period_count + 1
+                ELSE 1
+            END,
+            status       = 'active',
+            first_seen   = CASE
+                WHEN pipe_voids.status = 'active' THEN pipe_voids.first_seen
+                ELSE EXCLUDED.first_seen
+            END
+    """)
+
+if void_pairs:
+    exclusion = ' OR '.join(
+        f"(persistent_cluster_a = {plpy.quote_literal(a)}"
+        f" AND persistent_cluster_b = {plpy.quote_literal(b)})"
+        for a, b in void_pairs
+    )
+    plpy.execute(f"""
+        UPDATE pipe_voids SET status = 'inactive'
+        WHERE corpus_id = {corpus_sql}
+          AND status    = 'active'
+          AND NOT ({exclusion})
+    """)
+else:
+    plpy.execute(f"""
+        UPDATE pipe_voids SET status = 'inactive'
+        WHERE corpus_id = {corpus_sql} AND status = 'active'
+    """)
+
+rv3 = plpy.execute(f"""
+    SELECT COALESCE(MAX(period_count), 0) AS max_p
+    FROM pipe_voids
+    WHERE corpus_id = {corpus_sql}
+      AND status    = 'active'
+      AND last_seen = {period_str}
+""")
+max_p = rv3[0]['max_p']
+plpy.execute(f"""
+    UPDATE pipe_period_stats
+    SET max_void_persistence = {max_p}
+    WHERE period_start = {period_sql} AND corpus_id = {corpus_sql}
+""")
+
+return json.dumps({'n_voids': n_voids, 'max_persistence': max_p,
+                   'elapsed_s': round(time.time()-t0, 2)})
+
+
+=== find_bridge_chunks ===
+
+import json
+
+period_sql = plpy.quote_literal(str(p_period_start))
+corpus_sql = plpy.quote_literal(p_corpus_id)
+
+# Top N chunks by betweenness
+rv = plpy.execute("""
+    SELECT cp.chunk_id,
+           ch.idea_text,
+           cp.cluster_id,
+           cl.cluster_label,
+           cp.betweenness
+    FROM chunk_periods cp
+    JOIN data_chunks   ch ON ch.chunk_id = cp.chunk_id
+    JOIN clusters cl ON cl.cluster_id  = cp.cluster_id
+                     AND cl.period_start = cp.period_start
+                     AND cl.corpus_id    = cp.corpus_id
+    WHERE cp.period_start = %s
+      AND cp.corpus_id    = %s
+      AND cp.betweenness  IS NOT NULL
+      AND cp.cluster_id   IS NOT NULL
+    ORDER BY cp.betweenness DESC
+    LIMIT %d
+""" % (period_sql, corpus_sql, p_top_n))
+
+if not rv:
+    return []
+
+# For each top chunk, find which clusters its knn neighbors belong to
+results = []
+for row in rv:
+    cid = row['chunk_id']
+
+    rv_nbrs = plpy.execute("""
+        SELECT DISTINCT cl2.cluster_label
+        FROM knn_edges ke
+        JOIN chunk_periods cp2 ON cp2.chunk_id    = ke.neighbor_id
+                               AND cp2.period_start = ke.period_start
+                               AND cp2.corpus_id    = ke.corpus_id
+        JOIN clusters cl2      ON cl2.cluster_id   = cp2.cluster_id
+                               AND cl2.period_start = cp2.period_start
+                               AND cl2.corpus_id    = cp2.corpus_id
+        WHERE ke.chunk_id     = '%s'
+          AND ke.period_start = %s
+          AND ke.corpus_id    = %s
+          AND cp2.cluster_id  IS NOT NULL
+          AND cp2.cluster_id  != %d
+          AND cl2.cluster_label IS NOT NULL
+    """ % (cid.replace("'","''"), period_sql, corpus_sql,
+           row['cluster_id'] if row['cluster_id'] is not None else -1))
+
+    connected = [r['cluster_label'] for r in rv_nbrs]
+
+    results.append({
+        'chunk_id':        cid,
+        'idea_text':       row['idea_text'],
+        'cluster_id':      row['cluster_id'],
+        'cluster_label':   row['cluster_label'],
+        'betweenness':     row['betweenness'],
+        'connects_clusters': connected,
+    })
+
+return results
+
+
+=== find_path_between_clusters ===
+
+from collections import deque
+
+period_sql = plpy.quote_literal(str(p_period_start))
+corpus_sql = plpy.quote_literal(p_corpus_id)
+
+# Load cluster membership
+rv = plpy.execute("""
+    SELECT chunk_id, cluster_id
+    FROM chunk_periods
+    WHERE period_start = %s AND corpus_id = %s
+      AND cluster_id IS NOT NULL
+""" % (period_sql, corpus_sql))
+
+cluster_of = {}
+seeds_a    = []
+seeds_b    = set()
+for row in rv:
+    cid = row['chunk_id']
+    cl  = row['cluster_id']
+    cluster_of[cid] = cl
+    if cl == p_cluster_a:
+        seeds_a.append(cid)
+    elif cl == p_cluster_b:
+        seeds_b.add(cid)
+
+if not seeds_a:
+    plpy.notice("Cluster A (%d) not found in period" % p_cluster_a)
+    return []
+if not seeds_b:
+    plpy.notice("Cluster B (%d) not found in period" % p_cluster_b)
+    return []
+
+# Build adjacency
+rv_edges = plpy.execute("""
+    SELECT chunk_id, neighbor_id
+    FROM knn_edges
+    WHERE period_start = %s AND corpus_id = %s
+""" % (period_sql, corpus_sql))
+
+adj = {}
+for row in rv_edges:
+    a, b = row['chunk_id'], row['neighbor_id']
+    adj.setdefault(a, []).append(b)
+    adj.setdefault(b, []).append(a)
+
+# BFS with parent tracking — multi-source from all cluster_a seeds
+parent  = {s: None for s in seeds_a}
+visited = set(seeds_a)
+queue   = deque((s, 0) for s in seeds_a)
+found   = None
+
+while queue and found is None:
+    node, dist = queue.popleft()
+    if dist >= p_max_hops:
+        continue
+    for nbr in adj.get(node, []):
+        if nbr not in visited:
+            parent[nbr] = node
+            visited.add(nbr)
+            if nbr in seeds_b:
+                found = nbr
+                break
+            queue.append((nbr, dist + 1))
+
+if found is None:
+    plpy.notice("No path found between cluster %d and %d within %d hops"
+                % (p_cluster_a, p_cluster_b, p_max_hops))
+    return []
+
+# Reconstruct path
+path = []
+node = found
+while node is not None:
+    path.append(node)
+    node = parent[node]
+path.reverse()
+
+# Fetch idea_text for path chunks
+chunk_ids_sql = "ARRAY[" + ",".join("'%s'" % c.replace("'","''") for c in path) + "]"
+rv_text = plpy.execute("""
+    SELECT chunk_id, idea_text
+    FROM data_chunks
+    WHERE chunk_id = ANY(%s)
+""" % chunk_ids_sql)
+
+text_of = {r['chunk_id']: r['idea_text'] for r in rv_text}
+
+results = []
+for hop, cid in enumerate(path):
+    results.append({
+        'chunk_id':   cid,
+        'idea_text':  text_of.get(cid, ''),
+        'cluster_id': cluster_of.get(cid),
+        'hop':        hop,
+    })
+
+return results
+
+
+=== get_graph_distance_between_clusters ===
+
+from collections import deque
+import json
+
+if p_cluster_a == p_cluster_b:
+    return 0
+
+period_sql = plpy.quote_literal(str(p_period_start))
+corpus_sql = plpy.quote_literal(p_corpus_id)
+
+# Load chunk→cluster mapping for this period
+rv = plpy.execute("""
+    SELECT chunk_id, cluster_id
+    FROM chunk_periods
+    WHERE period_start = %s AND corpus_id = %s
+      AND cluster_id IS NOT NULL
+""" % (period_sql, corpus_sql))
+
+cluster_of = {}
+seeds_a    = set()
+seeds_b    = set()
+for row in rv:
+    cid = row['chunk_id']
+    cl  = row['cluster_id']
+    cluster_of[cid] = cl
+    if cl == p_cluster_a:
+        seeds_a.add(cid)
+    elif cl == p_cluster_b:
+        seeds_b.add(cid)
+
+if not seeds_a or not seeds_b:
+    return None  # cluster not found
+
+# Build adjacency from knn_edges (undirected)
+rv_edges = plpy.execute("""
+    SELECT chunk_id, neighbor_id
+    FROM knn_edges
+    WHERE period_start = %s AND corpus_id = %s
+""" % (period_sql, corpus_sql))
+
+adj = {}
+for row in rv_edges:
+    a, b = row['chunk_id'], row['neighbor_id']
+    adj.setdefault(a, []).append(b)
+    adj.setdefault(b, []).append(a)
+
+# Multi-source BFS from ALL cluster_a seeds simultaneously
+# Distance = number of knn_edges hops to reach any cluster_b chunk
+visited = {s: 0 for s in seeds_a}
+queue   = deque((s, 0) for s in seeds_a)
+
+while queue:
+    node, dist = queue.popleft()
+    if dist >= p_max_hops:
+        continue
+    for nbr in adj.get(node, []):
+        if nbr in seeds_b:
+            return dist + 1
+        if nbr not in visited:
+            visited[nbr] = dist + 1
+            queue.append((nbr, dist + 1))
+
+return None  # unreachable within max_hops
+
+
+=== run_cluster_matching ===
+
+import numpy as np
+
+_CONT_THRESH_DEFAULT = 0.90
+_WEAK_THRESH_DEFAULT = 0.70
+
+# ── 1. Load config ─────────────────────────────────────────────────────────────
+cont_thresh = _CONT_THRESH_DEFAULT
+weak_thresh = _WEAK_THRESH_DEFAULT
+for row in plpy.execute("""
+    SELECT key, value FROM pipeline_config
+    WHERE key IN ('MATCH_CONTINUATION_THRESHOLD', 'MATCH_WEAK_THRESHOLD')
+"""):
+    if row['key'] == 'MATCH_CONTINUATION_THRESHOLD':
+        cont_thresh = float(row['value'])
+    elif row['key'] == 'MATCH_WEAK_THRESHOLD':
+        weak_thresh = float(row['value'])
+
+# ── 2. Load active periods ─────────────────────────────────────────────────────
+# Use pipe_clusters (centroids must exist from compute_centroids Stage 4A).
+# Filter is_junk=FALSE so junk clusters never participate in matching.
+from_clause = f"AND period_start >= '{p_from_period}'" if p_from_period is not None else ""
+period_rv = plpy.execute(f"""
+    SELECT DISTINCT period_start
+    FROM pipe_clusters
+    WHERE corpus_id = '{p_corpus_id}'
+      AND is_junk   = FALSE
+      AND centroid  IS NOT NULL
+      {from_clause}
+    ORDER BY period_start
+""")
+periods = [row['period_start'] for row in period_rv]
+
+if len(periods) < 2:
+    plpy.notice(
+        f"run_cluster_matching: only {len(periods)} period(s) with centroids "
+        f"for {p_corpus_id} — nothing to match"
+    )
+    return
+
+# ── 3. Centroid loader ─────────────────────────────────────────────────────────
+def load_centroids(period_start):
+    """Return (list_of_cluster_ids, float32 matrix of L2-normalised rows)."""
+    rv = plpy.execute(f"""
+        SELECT cluster_id, centroid::float4[] AS vec
+        FROM pipe_clusters
+        WHERE corpus_id    = '{p_corpus_id}'
+          AND period_start = '{period_start}'
+          AND is_junk      = FALSE
+          AND centroid     IS NOT NULL
+        ORDER BY cluster_id
+    """)
+    cids, vecs = [], []
+    for row in rv:
+        arr  = np.array(row['vec'], dtype=np.float32)
+        norm = np.linalg.norm(arr)
+        if norm > 1e-9:
+            arr /= norm
+        cids.append(row['cluster_id'])
+        vecs.append(arr)
+    if not vecs:
+        return [], np.empty((0, 1024), dtype=np.float32)
+    return cids, np.stack(vecs)  # (n, 1024)
+
+# ── 4. Greedy bipartite matching ───────────────────────────────────────────────
+def greedy_match(ids_a, mat_a, ids_b, mat_b):
+    """Greedy highest-similarity-first bipartite assignment.
+
+    Returns:
+        matches     — list of (cid_a, cid_b, similarity:float, match_type:str)
+        death_idxs  — indices into ids_a with no match
+        birth_idxs  — indices into ids_b with no match
+    """
+    if len(ids_a) == 0 or len(ids_b) == 0:
+        return [], list(range(len(ids_a))), list(range(len(ids_b)))
+
+    sim = (mat_a @ mat_b.T).astype(np.float64)   # (|a|, |b|)
+
+    ia_arr, ib_arr = np.where(sim >= weak_thresh)
+    if len(ia_arr) == 0:
+        return [], list(range(len(ids_a))), list(range(len(ids_b)))
+
+    scores = sim[ia_arr, ib_arr]
+    order  = np.argsort(-scores)
+    ia_arr = ia_arr[order]
+    ib_arr = ib_arr[order]
+    scores = scores[order]
+
+    matched_a, matched_b, matches = set(), set(), []
+    for ia, ib, s in zip(ia_arr.tolist(), ib_arr.tolist(), scores.tolist()):
+        if ia in matched_a or ib in matched_b:
+            continue
+        matched_a.add(ia)
+        matched_b.add(ib)
+        mtype = 'CONTINUATION' if s >= cont_thresh else 'WEAK'
+        matches.append((ids_a[ia], ids_b[ib], float(s), mtype))
+
+    death_idxs = [i for i in range(len(ids_a)) if i not in matched_a]
+    birth_idxs = [i for i in range(len(ids_b)) if i not in matched_b]
+    return matches, death_idxs, birth_idxs
+
+# ── 5. Persistent ID counter ───────────────────────────────────────────────────
+# Format: '{corpus_id}_{nnnn:04d}', e.g. 'G06N_quarterly_0093'
+# REGEXP_REPLACE strips everything up to and including the last '_', leaving the
+# numeric suffix — safe for any number of digits (> 9999 allowed).
+prefix     = p_corpus_id + '_'
+prefix_len = len(prefix)   # e.g. len('G06N_quarterly_') = 15
+
+if p_from_period is None:
+    counter = [0]
+else:
+    try:
+        max_row = plpy.execute(f"""
+            SELECT COALESCE(MAX(
+                NULLIF(REGEXP_REPLACE(persistent_cluster_id, '^.*_', ''), '')::integer
+            ), 0) AS max_num
+            FROM pipe_clusters
+            WHERE corpus_id              = '{p_corpus_id}'
+              AND period_start           < '{p_from_period}'
+              AND persistent_cluster_id IS NOT NULL
+              AND persistent_cluster_id  LIKE '{prefix}%'
+              AND REGEXP_REPLACE(persistent_cluster_id, '^.*_', '') ~ '^[0-9]+$'
+        """)
+        counter = [int(max_row[0]['max_num']) if max_row and max_row[0]['max_num'] is not None else 0]
+    except Exception as e:
+        plpy.warning(f"run_cluster_matching: counter init failed ({e}), starting at 0")
+        counter = [0]
+
+def next_pid():
+    counter[0] += 1
+    return f"{prefix}{counter[0]:04d}"
+
+# ── 6. Registry initialisation ─────────────────────────────────────────────────
+# registry[period_start] = {cluster_id: persistent_cluster_id}
+# meta[period_start]     = {cluster_id: (similarity_or_None, match_type)}
+registry   = {}
+meta       = {}
+seed_period = None
+start_idx   = 0   # index into periods[] from which we write back assignments
+
+if p_from_period is not None:
+    # Incremental run: seed from the period immediately before from_period so
+    # new clusters correctly inherit the persistent IDs already in the DB.
+    seed_rv = plpy.execute(f"""
+        SELECT cluster_id, persistent_cluster_id
+        FROM pipe_clusters
+        WHERE corpus_id    = '{p_corpus_id}'
+          AND period_start = (
+              SELECT MAX(period_start)
+              FROM pipe_clusters
+              WHERE corpus_id    = '{p_corpus_id}'
+                AND period_start < '{p_from_period}'
+          )
+          AND is_junk               = FALSE
+          AND persistent_cluster_id IS NOT NULL
+    """)
+    if seed_rv:
+        seed_ps_rv = plpy.execute(f"""
+            SELECT MAX(period_start) AS ps
+            FROM pipe_clusters
+            WHERE corpus_id    = '{p_corpus_id}'
+              AND period_start < '{p_from_period}'
+        """)
+        seed_period = seed_ps_rv[0]['ps'] if seed_ps_rv and seed_ps_rv[0]['ps'] else None
+        if seed_period is not None:
+            registry[seed_period] = {
+                row['cluster_id']: row['persistent_cluster_id'] for row in seed_rv
+            }
+            meta[seed_period] = {
+                row['cluster_id']: (None, 'SEEDED') for row in seed_rv
+            }
+            # Prepend seed period so the first transition is seed→periods[0]
+            periods    = [seed_period] + list(periods)
+            start_idx  = 1   # skip seed period in write-back
+
+# Seed the first write-target period if not already in registry
+if periods[0] not in registry:
+    ids0, _ = load_centroids(periods[0])
+    registry[periods[0]] = {cid: next_pid() for cid in sorted(ids0)}
+    meta[periods[0]]     = {cid: (None, 'FIRST') for cid in ids0}
+
+# ── 7. Main matching loop ──────────────────────────────────────────────────────
+centroid_cache  = {}
+n_transitions   = 0
+n_continuations = 0
+n_births_total  = 0
+n_deaths_total  = 0
+
+def get_centroids(ps):
+    if ps not in centroid_cache:
+        centroid_cache[ps] = load_centroids(ps)
+    return centroid_cache[ps]
+
+for i in range(len(periods) - 1):
+    pa = periods[i]
+    pb = periods[i + 1]
+
+    ids_a, mat_a = get_centroids(pa)
+    ids_b, mat_b = get_centroids(pb)
+    prev_assignments = registry.get(pa, {})
+
+    if len(ids_a) == 0 or len(ids_b) == 0:
+        # Empty period: give all clusters in pb fresh IDs
+        registry[pb] = {cid: next_pid() for cid in sorted(ids_b)}
+        meta[pb]     = {cid: (None, 'BIRTH') for cid in ids_b}
+        n_transitions += 1
+        if pa in centroid_cache:
+            del centroid_cache[pa]
+        continue
+
+    matches, death_idxs, birth_idxs = greedy_match(ids_a, mat_a, ids_b, mat_b)
+
+    registry[pb] = {}
+    meta[pb]     = {}
+
+    for cid_a, cid_b, sim, mtype in matches:
+        # Inherit persistent ID from prior period; fall back to new ID if missing
+        inherited_pid = prev_assignments.get(cid_a) or next_pid()
+        registry[pb][cid_b] = inherited_pid
+        meta[pb][cid_b]     = (sim, mtype)
+        if mtype == 'CONTINUATION':
+            n_continuations += 1
+
+    for bi in birth_idxs:
+        cid_b = ids_b[bi]
+        registry[pb][cid_b] = next_pid()
+        meta[pb][cid_b]     = (None, 'BIRTH')
+
+    n_births_total += len(birth_idxs)
+    n_deaths_total += len(death_idxs)
+    n_transitions  += 1
+
+    # Free memory for periods we've moved past (keep seed_period in registry)
+    if pa in centroid_cache:
+        del centroid_cache[pa]
+
+# ── 8. Bulk write-back ─────────────────────────────────────────────────────────
+# Use a temp table + single UPDATE...FROM to avoid per-row round-trips.
+# For H01L: ~257k rows, a single UPDATE is orders of magnitude faster than
+# individual UPDATE statements.
+write_periods = periods[start_idx:]
+
+plpy.execute("DROP TABLE IF EXISTS _match_tmp")
+plpy.execute("""
+    CREATE TEMP TABLE _match_tmp (
+        persistent_cluster_id  text,
+        match_similarity       double precision,
+        match_type             text,
+        period_start           date,
+        cluster_id             integer
+    )
+""")
+
+# Build VALUES rows in chunks of 5000 to avoid overly large single SQL strings
+_CHUNK = 5000
+buf     = []
+n_written = 0
+
+for ps in write_periods:
+    period_meta  = meta.get(ps, {})
+    assignments  = registry.get(ps, {})
+    for cid, pid in assignments.items():
+        sim, mtype = period_meta.get(cid, (None, 'UNKNOWN'))
+        # All string values are safe: pid = '{corpus_id}_{nnnn}' (alphanum+_),
+        # mtype ∈ {CONTINUATION,WEAK,BIRTH,FIRST,SEEDED,UNKNOWN}, ps = date
+        sim_sql = str(sim) if sim is not None else 'NULL'
+        buf.append(f"('{pid}',{sim_sql},'{mtype}','{ps}'::date,{int(cid)})")
+        n_written += 1
+        if len(buf) >= _CHUNK:
+            plpy.execute("INSERT INTO _match_tmp VALUES " + ",".join(buf))
+            buf = []
+if buf:
+    plpy.execute("INSERT INTO _match_tmp VALUES " + ",".join(buf))
+
+# Single bulk UPDATE
+plpy.execute(f"""
+    UPDATE pipe_clusters c
+    SET persistent_cluster_id = t.persistent_cluster_id,
+        match_similarity       = t.match_similarity,
+        match_type             = t.match_type
+    FROM _match_tmp t
+    WHERE c.corpus_id    = '{p_corpus_id}'
+      AND c.period_start = t.period_start
+      AND c.cluster_id   = t.cluster_id
+""")
+
+plpy.execute("DROP TABLE IF EXISTS _match_tmp")
+
+# ── 9. Fix lifecycle flags ─────────────────────────────────────────────────────
+# Always run after matching — is_new/is_dead depend on complete persistent_cluster_id
+# coverage across all periods for this corpus.
+try:
+    lf_rv = plpy.execute(
+        f"CALL fix_lifecycle_flags('{p_corpus_id}', NULL::integer, NULL::integer, NULL::integer)"
+    )
+    if lf_rv:
+        r = lf_rv[0]
+        plpy.notice(
+            f"run_cluster_matching: lifecycle flags — "
+            f"reset={r.get('p_n_reset', '?')} "
+            f"new={r.get('p_n_new', '?')} "
+            f"dead={r.get('p_n_dead', '?')}"
+        )
+except Exception as e:
+    plpy.warning(f"run_cluster_matching: fix_lifecycle_flags failed: {e}")
+
+# ── 10. Summary notice ─────────────────────────────────────────────────────────
+plpy.notice(
+    f"run_cluster_matching: corpus={p_corpus_id} "
+    f"periods={len(write_periods)} transitions={n_transitions} written={n_written} "
+    f"continuations={n_continuations} births={n_births_total} deaths={n_deaths_total} "
+    f"cont_thresh={cont_thresh:.2f} weak_thresh={weak_thresh:.2f}"
+)
+
+
+=== void_fill_threshold ===
+
+import numpy as np
+
+period_sql = plpy.quote_literal(str(p_period_start))
+corpus_sql = plpy.quote_literal(p_corpus_id)
+
+rv_cfg = plpy.execute("SELECT key, value FROM pipeline_config "
+                      "WHERE key IN ('VOID_PAIR_THRESHOLD','VOID_MIDPOINT_RADIUS')")
+cfg         = {r['key']: float(r['value']) for r in rv_cfg}
+pair_thresh = cfg.get('VOID_PAIR_THRESHOLD',  0.3)
+mid_thresh  = cfg.get('VOID_MIDPOINT_RADIUS', 0.15)
+
+rv = plpy.execute("""
+    SELECT cluster_id, centroid::float4[] AS c
+    FROM clusters
+    WHERE period_start = %s
+      AND corpus_id    = %s
+      AND centroid IS NOT NULL
+      AND (is_junk IS NULL OR is_junk = FALSE)
+""" % (period_sql, corpus_sql))
+
+if len(rv) < 2:
+    return []
+
+cluster_ids = [r['cluster_id'] for r in rv]
+C      = np.array([r['c'] for r in rv], dtype=np.float32)
+norms  = np.linalg.norm(C, axis=1, keepdims=True)
+norms  = np.where(norms < 1e-9, 1e-9, norms)
+C_norm = C / norms
+
+sim   = C_norm @ C_norm.T
+dist  = 1.0 - sim
+i_idx, j_idx = np.where(np.triu(dist > pair_thresh, k=1))
+
+if len(i_idx) == 0:
+    return []
+
+rv2 = plpy.execute("""
+    SELECT ch.embedding::float4[] AS e
+    FROM chunk_periods cp
+    JOIN data_chunks ch ON ch.chunk_id = cp.chunk_id
+    WHERE cp.period_start = %s
+      AND cp.corpus_id    = %s
+      AND ch.embedding IS NOT NULL
+""" % (period_sql, corpus_sql))
+
+if rv2:
+    E      = np.array([r['e'] for r in rv2], dtype=np.float32)
+    e_norm = np.linalg.norm(E, axis=1, keepdims=True)
+    e_norm = np.where(e_norm < 1e-9, 1e-9, e_norm)
+    E_norm = E / e_norm
+else:
+    E_norm = None
+
+results = []
+for i, j in zip(i_idx.tolist(), j_idx.tolist()):
+    mid     = C_norm[i] + C_norm[j]
+    mid_len = float(np.linalg.norm(mid))
+
+    if mid_len < 1e-9:
+        min_dist_to_mid = 1.0
+    else:
+        mid_unit = (mid / mid_len).astype(np.float32)
+        if E_norm is not None and len(E_norm) > 0:
+            max_sim = float((E_norm @ mid_unit).max())
+        else:
+            max_sim = 0.0
+        min_dist_to_mid = 1.0 - max_sim
+
+    if min_dist_to_mid <= mid_thresh:
+        continue  # Not a void
+
+    current_density = float(1.0 - min_dist_to_mid)
+    gap_depth       = float(min_dist_to_mid - mid_thresh)
+    chunks_needed   = max(1, round(gap_depth / 0.05))
+
+    if mid_len >= 1e-9:
+        mid_unit_f64 = (mid / mid_len).astype(np.float64)
+        centroid_str = '[' + ','.join('%.6f' % x for x in mid_unit_f64.tolist()) + ']'
+    else:
+        centroid_str = None
+
+    results.append({
+        'cluster_a':             cluster_ids[i],
+        'cluster_b':             cluster_ids[j],
+        'void_centroid':         centroid_str,
+        'current_density':       round(current_density, 4),
+        'gap_depth':             round(gap_depth, 4),
+        'chunks_needed_to_fill': int(chunks_needed),
+    })
+
+return results
+
+

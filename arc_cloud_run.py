@@ -644,37 +644,29 @@ def run_cugraph(
                                   "katz_centrality": "katz_centrality"})
         chunk_graph = chunk_graph.merge(kz, on="chunk_id", how="left")
 
-        # Harmonic centrality — mean inverse shortest-path to all other
-        # chunks; well-defined on disconnected graphs; high = global
-        # integrator concept close to the rest of the corpus.
-        # cuGraph 26.x does not implement harmonic_centrality; fall back to
-        # NetworkX on CPU which handles disconnected graphs correctly.
-        try:
-            hc = cugraph.harmonic_centrality(G)
-            hc = hc.rename(columns={"vertex": "chunk_id",
-                                      "harmonic_centrality": "harmonic_centrality"})
-            chunk_graph = chunk_graph.merge(hc, on="chunk_id", how="left")
-        except Exception as exc:
-            log.warning("cugraph.harmonic_centrality unavailable (%s) — computing via NetworkX CPU fallback", exc)
-            import networkx as nx
-            # Build a lightweight NetworkX graph from the same edge list
-            nx_G = nx.Graph()
-            nx_G.add_nodes_from(edges_df["chunk_id"].to_arrow().to_pylist())
-            nx_G.add_edges_from(
-                zip(edges_df["chunk_id"].to_arrow().to_pylist(),
-                    edges_df["neighbor_id"].to_arrow().to_pylist())
-            )
-            hc_dict = nx.harmonic_centrality(nx_G)
-            # Normalise to [0,1] to match cuGraph's expected range
-            max_hc = max(hc_dict.values()) if hc_dict else 1.0
-            if max_hc == 0.0:
-                max_hc = 1.0
-            hc_norm = {k: v / max_hc for k, v in hc_dict.items()}
-            hc_df = cudf.DataFrame({
-                "chunk_id": list(hc_norm.keys()),
-                "harmonic_centrality": list(hc_norm.values()),
-            })
-            chunk_graph = chunk_graph.merge(hc_df, on="chunk_id", how="left")
+        # Harmonic centrality — sum of inverse shortest-path (hop count)
+        # to all other vertices; well-defined on disconnected graphs
+        # (unreachable pairs contribute 0). High = global integrator.
+        # cuGraph 26.x has no harmonic_centrality and multi_source_bfs is
+        # unimplemented. NetworkX is faster than a per-vertex BFS GPU loop
+        # due to kernel launch overhead (~40ms/vertex vs ~0.1ms/vertex CPU).
+        import networkx as nx
+        nx_G = nx.Graph()
+        nx_G.add_nodes_from(edges_df["chunk_id"].to_arrow().to_pylist())
+        nx_G.add_edges_from(
+            zip(edges_df["chunk_id"].to_arrow().to_pylist(),
+                edges_df["neighbor_id"].to_arrow().to_pylist())
+        )
+        hc_dict = nx.harmonic_centrality(nx_G)
+        max_hc = max(hc_dict.values()) if hc_dict else 1.0
+        if max_hc == 0.0:
+            max_hc = 1.0
+        hc_norm = {k: v / max_hc for k, v in hc_dict.items()}
+        hc_df = cudf.DataFrame({
+            "chunk_id": list(hc_norm.keys()),
+            "harmonic_centrality": list(hc_norm.values()),
+        })
+        chunk_graph = chunk_graph.merge(hc_df, on="chunk_id", how="left")
 
         # in_degree_centrality — degree normalised by (n-1); derived from
         # degree rather than a separate kernel; scale-free connectivity

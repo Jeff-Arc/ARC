@@ -17,6 +17,7 @@ import argparse
 import io
 import json
 import os
+import re as _re
 import sys
 import time
 import traceback
@@ -47,44 +48,76 @@ DB_PARAMS = dict(
 )
 
 CREATE_TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS docdb_patents (
-    doc_id      text        NOT NULL,
-    country     text,
-    doc_number  text,
-    kind        text,
-    family_id   text,
-    pub_date    date,
-    title       text,
-    abstract    text,
-    cpc_codes   text[]      NOT NULL DEFAULT '{}',
-    applicants  text[]      NOT NULL DEFAULT '{}',
-    citations   text[]      NOT NULL DEFAULT '{}',
-    raw_xml     text,
-    ingested_at timestamptz NOT NULL DEFAULT now(),
+CREATE UNLOGGED TABLE IF NOT EXISTS arc_v5.docdb_patents (
+    doc_id              text        NOT NULL,
+    country             text,
+    doc_number          text,
+    kind                text,
+    family_id           text,
+    pub_date            date,
+    title               text,
+    abstract            text,
+    cpc_codes           text[]      NOT NULL DEFAULT '{}',
+    ipc_codes           text[]      NOT NULL DEFAULT '{}',
+    ipcr_codes          text[]      NOT NULL DEFAULT '{}',
+    applicants          text[]      NOT NULL DEFAULT '{}',
+    applicant_countries text[]      NOT NULL DEFAULT '{}',
+    inventors           text[]      NOT NULL DEFAULT '{}',
+    inventor_countries  text[]      NOT NULL DEFAULT '{}',
+    language            text,
+    filing_date         date,
+    application_number  text,
+    priority_countries  text[]      NOT NULL DEFAULT '{}',
+    priority_numbers    text[]      NOT NULL DEFAULT '{}',
+    priority_dates      date[]      NOT NULL DEFAULT '{}',
+    is_representative   boolean,
+    date_added_docdb    date,
+    citations           text[]      NOT NULL DEFAULT '{}',
+    citation_categories text[]      NOT NULL DEFAULT '{}',
+    npl_citations       text[]      NOT NULL DEFAULT '{}',
+    raw_xml             text,
+    ingested_at         timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (doc_id)
 );
 """
 
 CREATE_INDEX_SQL = """
 CREATE INDEX IF NOT EXISTS docdb_patents_cpc_gin
-    ON docdb_patents USING GIN (cpc_codes);
+    ON arc_v5.docdb_patents USING GIN (cpc_codes);
+CREATE INDEX IF NOT EXISTS docdb_patents_ipc_gin
+    ON arc_v5.docdb_patents USING GIN (ipc_codes);
 CREATE INDEX IF NOT EXISTS docdb_patents_country_idx
-    ON docdb_patents (country);
+    ON arc_v5.docdb_patents (country);
 CREATE INDEX IF NOT EXISTS docdb_patents_pub_date_idx
-    ON docdb_patents (pub_date);
+    ON arc_v5.docdb_patents (pub_date);
 CREATE INDEX IF NOT EXISTS docdb_patents_family_idx
-    ON docdb_patents (family_id);
+    ON arc_v5.docdb_patents (family_id);
+CREATE INDEX IF NOT EXISTS docdb_patents_language_idx
+    ON arc_v5.docdb_patents (language);
+CREATE INDEX IF NOT EXISTS docdb_patents_filing_date_idx
+    ON arc_v5.docdb_patents (filing_date);
+CREATE INDEX IF NOT EXISTS docdb_patents_app_num_idx
+    ON arc_v5.docdb_patents (application_number);
 """
 
+# Column order must match doc_to_row() output
 INSERT_SQL = """
-INSERT INTO docdb_patents
+INSERT INTO arc_v5.docdb_patents
     (doc_id, country, doc_number, kind, family_id, pub_date,
-     title, abstract, cpc_codes, applicants, citations, raw_xml)
+     title, abstract,
+     cpc_codes, ipc_codes, ipcr_codes,
+     applicants, applicant_countries,
+     inventors, inventor_countries,
+     language, filing_date, application_number,
+     priority_countries, priority_numbers, priority_dates,
+     is_representative, date_added_docdb,
+     citations, citation_categories, npl_citations,
+     raw_xml)
 VALUES %s
 ON CONFLICT (doc_id) DO NOTHING
 """
 
-BATCH_SIZE = 5000
+BATCH_SIZE = 10000
 
 
 # ── XML helpers ───────────────────────────────────────────────────────────────
@@ -108,17 +141,24 @@ def _parse_date(s: str | None) -> date | None:
 
 
 def extract_doc(doc_el, include_raw: bool = True) -> dict:
-    """Extract one exchange-document element into a dict."""
-    doc_id    = doc_el.get("doc-id")
-    country   = doc_el.get("country")
+    """Extract one exchange-document element into a dict with all fields."""
+    doc_id     = doc_el.get("doc-id")
+    country    = doc_el.get("country")
     doc_number = doc_el.get("doc-number")
-    kind      = doc_el.get("kind")
-    family_id = doc_el.get("family-id")
-    pub_date  = _parse_date(doc_el.get("date-publ"))
+    kind       = doc_el.get("kind")
+    family_id  = doc_el.get("family-id")
+    pub_date   = _parse_date(doc_el.get("date-publ"))
+
+    # is-representative attribute
+    is_rep_str = doc_el.get("is-representative")
+    is_representative = True if is_rep_str == "YES" else (False if is_rep_str == "NO" else None)
+
+    # date-added-docdb attribute
+    date_added_docdb = _parse_date(doc_el.get("date-added-docdb"))
 
     bib = doc_el.find(f"{NS_TAG}bibliographic-data")
 
-    # Title — prefer English, fall back to first
+    # ── Title — prefer English, fall back to first ──
     title = None
     if bib is not None:
         en_titles = [t for t in bib.findall(f"{NS_TAG}invention-title") if t.get("lang") == "en"]
@@ -126,16 +166,18 @@ def extract_doc(doc_el, include_raw: bool = True) -> dict:
         for t in (en_titles or all_titles)[:1]:
             title = _text_or_none(t)
 
-    # Abstract — prefer English, fall back to first
+    # ── Abstract — prefer English, fall back to first ──
     abstract = None
     en_abs = [a for a in doc_el.iter(f"{NS_TAG}abstract") if a.get("lang") == "en"]
     all_abs = list(doc_el.iter(f"{NS_TAG}abstract"))
     for ab in (en_abs or all_abs)[:1]:
-        p = ab.find("p")
+        # Try exch:p first, then bare p, then the abstract element itself
+        p = ab.find(f"{NS_TAG}p")
+        if p is None:
+            p = ab.find("p")
         abstract = _text_or_none(p if p is not None else ab)
 
-    # CPC codes — classification-symbol children of patent-classifications
-    # NOTE: patent-classifications uses NS but its children do NOT
+    # ── CPC codes — patent-classifications ──
     cpc_codes = []
     if bib is not None:
         pc = bib.find(f"{NS_TAG}patent-classifications")
@@ -147,78 +189,222 @@ def extract_doc(doc_el, include_raw: bool = True) -> dict:
                     seen.add(code)
                     cpc_codes.append(code)
 
-    # Applicants — docdb format, deduplicated
-    applicants = []
+    # ── IPC codes (old format) — classification-ipc ──
+    ipc_codes = []
     if bib is not None:
-        seen = set()
-        for app in bib.findall(f".//{NS_TAG}applicant[@data-format='docdb']/{NS_TAG}applicant-name/name"):
-            name = (app.text or "").strip()
-            if name and name not in seen:
-                seen.add(name)
-                applicants.append(name)
+        ipc = bib.find(f"{NS_TAG}classification-ipc")
+        if ipc is not None:
+            seen = set()
+            # main-classification + further-classification
+            for el in ipc.findall("main-classification"):
+                code = (el.text or "").strip()
+                if code and code not in seen:
+                    seen.add(code)
+                    ipc_codes.append(code)
+            for el in ipc.findall("further-classification"):
+                code = (el.text or "").strip()
+                if code and code not in seen:
+                    seen.add(code)
+                    ipc_codes.append(code)
 
-    # Citations — "{country}{doc-number}" strings
+    # ── IPCR codes (reformed IPC) — classifications-ipcr ──
+    ipcr_codes = []
+    if bib is not None:
+        ipcr = bib.find(f"{NS_TAG}classifications-ipcr")
+        if ipcr is not None:
+            seen = set()
+            for el in ipcr.findall("classification-ipcr/text"):
+                code = (el.text or "").strip()
+                if code and code not in seen:
+                    seen.add(code)
+                    ipcr_codes.append(code)
+
+    # ── Applicants — docdb format names + residence countries ──
+    applicants = []
+    applicant_countries = []
+    if bib is not None:
+        seen_names = set()
+        for app_el in bib.findall(f".//{NS_TAG}applicant[@data-format='docdb']"):
+            name_el = app_el.find(f"{NS_TAG}applicant-name/name")
+            name = (name_el.text or "").strip() if name_el is not None else ""
+            if name and name not in seen_names:
+                seen_names.add(name)
+                applicants.append(name)
+                # Residence country
+                res = app_el.find(f"residence/country")
+                if res is None:
+                    res = app_el.find(f"{NS_TAG}residence/{NS_TAG}country")
+                applicant_countries.append((res.text or "").strip() if res is not None else "")
+
+    # ── Inventors — docdb format names + residence countries ──
+    inventors = []
+    inventor_countries = []
+    if bib is not None:
+        seen_names = set()
+        for inv_el in bib.findall(f".//{NS_TAG}inventor[@data-format='docdb']"):
+            name_el = inv_el.find(f"{NS_TAG}inventor-name/name")
+            name = (name_el.text or "").strip() if name_el is not None else ""
+            if name and name not in seen_names:
+                seen_names.add(name)
+                inventors.append(name)
+                res = inv_el.find(f"residence/country")
+                if res is None:
+                    res = inv_el.find(f"{NS_TAG}residence/{NS_TAG}country")
+                inventor_countries.append((res.text or "").strip() if res is not None else "")
+
+    # ── Language of publication ──
+    language = None
+    if bib is not None:
+        lang_el = bib.find(f"{NS_TAG}language-of-publication")
+        if lang_el is not None:
+            language = (lang_el.text or "").strip() or None
+
+    # ── Application reference — filing date + application number ──
+    filing_date = None
+    application_number = None
+    if bib is not None:
+        # Prefer docdb format
+        app_ref = bib.find(f"{NS_TAG}application-reference[@data-format='docdb']")
+        if app_ref is None:
+            app_ref = bib.find(f"{NS_TAG}application-reference")
+        if app_ref is not None:
+            did = app_ref.find("document-id")
+            if did is None:
+                did = app_ref.find(f"{NS_TAG}document-id")
+            if did is not None:
+                dn = did.find("doc-number")
+                if dn is None:
+                    dn = did.find(f"{NS_TAG}doc-number")
+                if dn is not None:
+                    application_number = (dn.text or "").strip() or None
+                dt = did.find("date")
+                if dt is None:
+                    dt = did.find(f"{NS_TAG}date")
+                if dt is not None:
+                    filing_date = _parse_date((dt.text or "").strip())
+
+    # ── Priority claims ──
+    priority_countries = []
+    priority_numbers = []
+    priority_dates = []
+    if bib is not None:
+        pc_el = bib.find(f"{NS_TAG}priority-claims")
+        if pc_el is not None:
+            seen_prio = set()
+            for claim in pc_el.findall(f"{NS_TAG}priority-claim[@data-format='docdb']"):
+                did = claim.find("document-id")
+                if did is None:
+                    did = claim.find(f"{NS_TAG}document-id")
+                if did is None:
+                    continue
+                cc = did.find("country")
+                if cc is None:
+                    cc = did.find(f"{NS_TAG}country")
+                dn = did.find("doc-number")
+                if dn is None:
+                    dn = did.find(f"{NS_TAG}doc-number")
+                dt = did.find("date")
+                if dt is None:
+                    dt = did.find(f"{NS_TAG}date")
+
+                cc_text = (cc.text or "").strip() if cc is not None else ""
+                dn_text = (dn.text or "").strip() if dn is not None else ""
+                prio_key = f"{cc_text}{dn_text}"
+                if prio_key in seen_prio:
+                    continue
+                seen_prio.add(prio_key)
+
+                priority_countries.append(cc_text)
+                priority_numbers.append(dn_text)
+                pdate = _parse_date((dt.text or "").strip()) if dt is not None else None
+                priority_dates.append(pdate)
+
+    # ── Citations — patent citations with categories + NPL citations ──
     citations = []
+    citation_categories = []
+    npl_citations = []
     seen_cites = set()
     for cite in doc_el.iter(f"{NS_TAG}citation"):
-        # prefer docdb format doc-id
-        for ref in cite.findall(".//document-id"):
-            cc = ref.find("country")
-            cn = ref.find("doc-number")
-            ck = ref.find("kind")
-            if cc is not None and cn is not None:
-                key = f"{cc.text}{cn.text}{ck.text if ck is not None else ''}"
-                if key not in seen_cites:
-                    seen_cites.add(key)
-                    citations.append(key)
-            break  # one ref per citation element is enough
+        # Patent citations
+        patcit = cite.find("patcit")
+        if patcit is None:
+            patcit = cite.find(f"{NS_TAG}patcit")
+        if patcit is not None:
+            for ref in patcit.findall("document-id"):
+                cc = ref.find("country")
+                cn = ref.find("doc-number")
+                ck = ref.find("kind")
+                if cc is not None and cn is not None:
+                    key = f"{cc.text}{cn.text}{ck.text if ck is not None else ''}"
+                    if key not in seen_cites:
+                        seen_cites.add(key)
+                        citations.append(key)
+                        # Category for this citation
+                        cat_el = cite.find("category")
+                        if cat_el is None:
+                            cat_el = cite.find(f"{NS_TAG}category")
+                        cat = (cat_el.text or "").strip() if cat_el is not None else ""
+                        citation_categories.append(cat)
+                break  # one ref per patcit
 
-    # Raw XML
+        # NPL citations
+        nplcit = cite.find("nplcit")
+        if nplcit is None:
+            nplcit = cite.find(f"{NS_TAG}nplcit")
+        if nplcit is not None:
+            npl_text = _text_or_none(nplcit)
+            if npl_text:
+                npl_citations.append(npl_text[:2000])  # cap length
+
+    # ── Raw XML ──
     raw = None
     if include_raw and HAVE_LXML:
         raw = etree.tostring(doc_el, encoding="unicode")
 
     return {
-        "doc_id":     doc_id,
-        "country":    country,
-        "doc_number": doc_number,
-        "kind":       kind,
-        "family_id":  family_id,
-        "pub_date":   pub_date,
-        "title":      title,
-        "abstract":   abstract,
-        "cpc_codes":  cpc_codes,
-        "applicants": applicants,
-        "citations":  citations,
-        "raw_xml":    raw,
+        "doc_id":              doc_id,
+        "country":             country,
+        "doc_number":          doc_number,
+        "kind":                kind,
+        "family_id":           family_id,
+        "pub_date":            pub_date,
+        "title":               title,
+        "abstract":            abstract,
+        "cpc_codes":           cpc_codes,
+        "ipc_codes":           ipc_codes,
+        "ipcr_codes":          ipcr_codes,
+        "applicants":          applicants,
+        "applicant_countries": applicant_countries,
+        "inventors":           inventors,
+        "inventor_countries":  inventor_countries,
+        "language":            language,
+        "filing_date":         filing_date,
+        "application_number":  application_number,
+        "priority_countries":  priority_countries,
+        "priority_numbers":    priority_numbers,
+        "priority_dates":      priority_dates,
+        "is_representative":   is_representative,
+        "date_added_docdb":    date_added_docdb,
+        "citations":           citations,
+        "citation_categories": citation_categories,
+        "npl_citations":       npl_citations,
+        "raw_xml":             raw,
     }
 
-
-import re as _re
 
 _DOCTYPE_RE  = _re.compile(rb'<!DOCTYPE\s[^[>]*(?:\[[^\]]*\])?\s*>', _re.DOTALL)
 _ENTITY_RE   = _re.compile(rb'&(?!amp;|lt;|gt;|apos;|quot;)[a-zA-Z][a-zA-Z0-9]*;')
 
 
 def _strip_entities(xml_bytes: bytes) -> bytes:
-    """Remove DOCTYPE declaration and unknown named entities so iterparse works.
-
-    Keeps the five XML builtins (&amp; &lt; &gt; &apos; &quot;).
-    Unknown entities (&alpha; etc. from docdb-entities.dtd) are replaced
-    with empty bytes — acceptable for our use since they only appear in
-    descriptive text fields, not structured data.
-    """
+    """Remove DOCTYPE declaration and unknown named entities so iterparse works."""
     xml_bytes = _DOCTYPE_RE.sub(b"", xml_bytes, count=1)
     xml_bytes = _ENTITY_RE.sub(b"", xml_bytes)
     return xml_bytes
 
 
 def parse_xml_stream(xml_bytes: bytes, include_raw: bool = True) -> Iterator[dict]:
-    """Stream-parse exchange-document elements from DOCDB XML bytes.
-
-    Strips the DTD + custom entities first, then uses iterparse for
-    O(1) memory — only one exchange-document element in memory at a time.
-    """
+    """Stream-parse exchange-document elements from DOCDB XML bytes."""
     if not HAVE_LXML:
         raise RuntimeError("lxml required for DOCDB XML parsing")
 
@@ -233,7 +419,6 @@ def parse_xml_stream(xml_bytes: bytes, include_raw: bool = True) -> Iterator[dic
     )
     for _event, doc in context:
         yield extract_doc(doc, include_raw=include_raw)
-        # Clear element and all preceding siblings to free memory
         doc.clear()
         while doc.getprevious() is not None:
             del doc.getparent()[0]
@@ -241,11 +426,7 @@ def parse_xml_stream(xml_bytes: bytes, include_raw: bool = True) -> Iterator[dic
 
 def iter_docdb_zip(outer_zip_path: str, include_raw: bool = True,
                    error_sink: list | None = None) -> Iterator[dict]:
-    """Yield all patent dicts from a DOCDB outer ZIP file.
-
-    error_sink: if provided, parse exceptions are appended as dicts rather
-    than raised, so a bad inner ZIP doesn't abort the whole outer ZIP.
-    """
+    """Yield all patent dicts from a DOCDB outer ZIP file."""
     outer = zipfile.ZipFile(outer_zip_path, "r")
     inner_zips = sorted(
         n for n in outer.namelist()
@@ -290,14 +471,24 @@ def ensure_table(conn):
     with conn.cursor() as cur:
         cur.execute(CREATE_TABLE_SQL)
     conn.commit()
-    print("Table docdb_patents ensured.")
+    print("Table docdb_patents ensured (UNLOGGED).")
 
 
 def create_indexes(conn):
+    print("Creating indexes (this may take a while on large tables)...")
     with conn.cursor() as cur:
         cur.execute(CREATE_INDEX_SQL)
     conn.commit()
     print("Indexes created.")
+
+
+def set_logged(conn):
+    """Convert UNLOGGED table to LOGGED after bulk ingest."""
+    print("Setting table to LOGGED...")
+    with conn.cursor() as cur:
+        cur.execute("ALTER TABLE arc_v5.docdb_patents SET LOGGED;")
+    conn.commit()
+    print("Table is now LOGGED.")
 
 
 def doc_to_row(d: dict):
@@ -311,30 +502,44 @@ def doc_to_row(d: dict):
         d["title"],
         d["abstract"],
         d["cpc_codes"],
+        d["ipc_codes"],
+        d["ipcr_codes"],
         d["applicants"],
+        d["applicant_countries"],
+        d["inventors"],
+        d["inventor_countries"],
+        d["language"],
+        d["filing_date"],
+        d["application_number"],
+        d["priority_countries"],
+        d["priority_numbers"],
+        d["priority_dates"],
+        d["is_representative"],
+        d["date_added_docdb"],
         d["citations"],
+        d["citation_categories"],
+        d["npl_citations"],
         d["raw_xml"],
     )
 
 
 def ingest_zip(conn, zip_path: str, include_raw: bool = True,
                error_log: Path | None = None,
-               delete_after: bool = False) -> dict:
-    """Ingest one outer ZIP. Returns stats dict.
-
-    error_log: path to JSONL file; each error record is appended as one JSON line.
-    """
+               delete_after: bool = False,
+               progress_file: Path | None = None) -> dict:
+    """Ingest one outer ZIP. Returns stats dict."""
     t0 = time.time()
     inserted = 0
     skipped = 0
     errors = 0
-    error_samples = []   # first 20 errors kept in memory for summary
+    error_samples = []
     batch = []
     total_seen = 0
-    parse_errors = []    # xml/zip exceptions from iter_docdb_zip
+    parse_errors = []
 
+    zip_name = Path(zip_path).name
     log_fh = open(error_log, "a") if error_log else None
-    print(f"Processing {Path(zip_path).name} ...")
+    print(f"Processing {zip_name} ...")
 
     def _record_error(err_dict: dict):
         nonlocal errors
@@ -345,8 +550,16 @@ def ingest_zip(conn, zip_path: str, include_raw: bool = True,
             log_fh.write(json.dumps(err_dict) + "\n")
             log_fh.flush()
 
+    def _log_progress():
+        if progress_file:
+            elapsed = time.time() - t0
+            rate = total_seen / elapsed if elapsed > 0 else 0
+            with open(progress_file, "a") as pf:
+                pf.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
+                         f"{zip_name}: {total_seen:,} docs, {inserted:,} inserted, "
+                         f"{errors:,} errors, {rate:,.0f} docs/s\n")
+
     for doc in iter_docdb_zip(zip_path, include_raw=include_raw, error_sink=parse_errors):
-        # Drain any parse exceptions collected so far
         for pe in parse_errors:
             _record_error(pe)
         parse_errors.clear()
@@ -375,8 +588,8 @@ def ingest_zip(conn, zip_path: str, include_raw: bool = True,
                 rate = total_seen / elapsed
                 print(f"  {total_seen:>8,} docs  {inserted:>8,} inserted  "
                       f"{errors:>5,} errors  {rate:,.0f} docs/s")
+                _log_progress()
 
-    # Drain any remaining parse exceptions
     for pe in parse_errors:
         _record_error(pe)
 
@@ -389,16 +602,23 @@ def ingest_zip(conn, zip_path: str, include_raw: bool = True,
         log_fh.close()
 
     elapsed = time.time() - t0
-    print(f"  Done: {total_seen:,} docs  {inserted:,} inserted  "
-          f"{skipped:,} skipped (conflict)  {errors:,} errors  "
-          f"{elapsed:.1f}s")
+    msg = (f"  Done: {total_seen:,} docs  {inserted:,} inserted  "
+           f"{skipped:,} skipped (conflict)  {errors:,} errors  "
+           f"{elapsed:.1f}s")
+    print(msg)
     if error_log and errors:
         print(f"  Error log: {error_log}")
+
+    if progress_file:
+        with open(progress_file, "a") as pf:
+            pf.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
+                     f"COMPLETED {zip_name}: {total_seen:,} docs, {inserted:,} inserted, "
+                     f"{skipped:,} skipped, {errors:,} errors, {elapsed:.1f}s\n")
 
     if delete_after and total_seen > 0:
         try:
             Path(zip_path).unlink()
-            print(f"  Deleted {Path(zip_path).name}")
+            print(f"  Deleted {zip_name}")
         except OSError as e:
             print(f"  WARNING: could not delete {zip_path}: {e}")
 
@@ -408,7 +628,6 @@ def ingest_zip(conn, zip_path: str, include_raw: bool = True,
 
 def _flush_batch(conn, batch: list) -> int:
     """Bulk-insert batch, return count of rows actually inserted."""
-    # Filter rows with null doc_id (some exchange-documents lack the attribute)
     valid = [row for row in batch if row[0] is not None and row[0] != ""]
     if not valid:
         return 0
@@ -429,6 +648,8 @@ def main():
                     help="Create table + indexes before ingesting")
     ap.add_argument("--create-indexes", action="store_true",
                     help="Create GIN + other indexes only (run after bulk load)")
+    ap.add_argument("--set-logged", action="store_true",
+                    help="Convert UNLOGGED table to LOGGED")
     ap.add_argument("--no-raw-xml",   action="store_true",
                     help="Skip storing raw_xml (saves ~10x storage)")
     ap.add_argument("--dry-run",      action="store_true",
@@ -439,6 +660,8 @@ def main():
                     help="JSONL file to append error records during ingest.")
     ap.add_argument("--delete-after", action="store_true",
                     help="Delete each ZIP after successful ingest to free disk space.")
+    ap.add_argument("--progress-file", default="/tmp/docdb_ingest_progress.txt",
+                    help="File to log progress updates (default: /tmp/docdb_ingest_progress.txt)")
     args = ap.parse_args()
 
     include_raw = not args.no_raw_xml
@@ -454,6 +677,11 @@ def main():
 
     if args.create_indexes:
         create_indexes(conn)
+        conn.close()
+        return
+
+    if args.set_logged:
+        set_logged(conn)
         conn.close()
         return
 
@@ -475,19 +703,21 @@ def main():
     if not args.no_raw_xml:
         print("  NOTE: raw_xml=ON (use --no-raw-xml to skip XML storage)")
 
-    grand_total = 0
-    grand_inserted = 0
-    t_all = time.time()
-
+    progress_file = Path(args.progress_file) if args.progress_file else None
     error_log_path = Path(args.error_log) if args.error_log else None
 
     grand_total = 0
     grand_inserted = 0
     grand_errors = 0
+    t_all = time.time()
+
+    if progress_file:
+        with open(progress_file, "a") as pf:
+            pf.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] === INGEST SESSION START === "
+                     f"Files: {len(zips)}, raw_xml={'ON' if not args.no_raw_xml else 'OFF'}\n")
 
     for zip_path in zips:
         if args.scan_errors:
-            # Parse-only, collect every error record, print samples
             t0 = time.time()
             all_errors = []
             parse_errors = []
@@ -516,13 +746,11 @@ def main():
             print(f"  Docs seen: {n:,}  Errors: {len(all_errors):,}  "
                   f"elapsed: {elapsed:.1f}s")
 
-            # Summarise by error type
             by_type: dict[str, int] = {}
             for e in all_errors:
                 by_type[e["type"]] = by_type.get(e["type"], 0) + 1
             print("  By type:", by_type)
 
-            # Print 5 samples
             print("  --- 5 error samples ---")
             for e in all_errors[:5]:
                 print(f"  {json.dumps(e, default=str)}")
@@ -542,6 +770,8 @@ def main():
             countries = {}
             abstracts = 0
             cpcs = 0
+            ipcs = 0
+            inventors_n = 0
             for doc in iter_docdb_zip(str(zip_path), include_raw=False):
                 n += 1
                 c = doc["country"]
@@ -550,18 +780,25 @@ def main():
                     abstracts += 1
                 if doc["cpc_codes"]:
                     cpcs += 1
+                if doc["ipc_codes"] or doc["ipcr_codes"]:
+                    ipcs += 1
+                if doc["inventors"]:
+                    inventors_n += 1
             elapsed = time.time() - t0
             print(f"\n{Path(zip_path).name}")
             print(f"  Patents: {n:,}  elapsed: {elapsed:.1f}s")
             print(f"  Abstracts: {abstracts:,} ({100*abstracts/n:.1f}%)")
             print(f"  With CPC:  {cpcs:,} ({100*cpcs/n:.1f}%)")
+            print(f"  With IPC:  {ipcs:,} ({100*ipcs/n:.1f}%)")
+            print(f"  With inventors: {inventors_n:,} ({100*inventors_n/n:.1f}%)")
             print("  Countries:", dict(sorted(countries.items(), key=lambda x: -x[1])[:10]))
             grand_total += n
 
         else:
             stats = ingest_zip(conn, str(zip_path), include_raw=include_raw,
                                error_log=error_log_path,
-                               delete_after=args.delete_after)
+                               delete_after=args.delete_after,
+                               progress_file=progress_file)
             grand_total += stats["total"]
             grand_inserted += stats["inserted"]
             grand_errors += stats["errors"]
@@ -574,8 +811,14 @@ def main():
         print(f"\nTotal: {grand_total:,} patents across {len(zips)} ZIP(s)  "
               f"({elapsed_all:.1f}s)")
     else:
-        print(f"\nAll done: {grand_total:,} total  {grand_inserted:,} inserted  "
-              f"{grand_errors:,} errors  {elapsed_all:.1f}s")
+        summary = (f"\nAll done: {grand_total:,} total  {grand_inserted:,} inserted  "
+                   f"{grand_errors:,} errors  {elapsed_all:.1f}s")
+        print(summary)
+        if progress_file:
+            with open(progress_file, "a") as pf:
+                pf.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] === SESSION COMPLETE === "
+                         f"{grand_total:,} total, {grand_inserted:,} inserted, "
+                         f"{grand_errors:,} errors, {elapsed_all:.1f}s\n")
 
     conn.close()
 

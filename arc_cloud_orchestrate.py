@@ -63,8 +63,9 @@ ENV_FILE     = ARC_DIR / ".env"
 VASTAI_BIN   = "/home/jeff/miniconda3/bin/vastai"
 PYTHON_BIN   = "/home/jeff/miniconda3/bin/python3"
 
-# Docker image — pytorch base with CUDA 12.4 runtime
-PYTORCH_IMAGE = "pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime"
+# Docker image — PyTorch base with CUDA 12.6 (commonly pre-cached on vast.ai)
+# ARC deps installed via SSH after boot (see install_deps)
+DOCKER_IMAGE = "pytorch/pytorch:2.6.0-cuda12.6-cudnn9-runtime"
 
 REMOTE_ROOT  = "/workspace/arc"
 REMOTE_IN    = f"{REMOTE_ROOT}/cloud_in"
@@ -323,7 +324,9 @@ def search_offers(min_vram_gb: int = 12, max_price: float = 0.15) -> list[dict]:
     # vast.ai query language: gpu_ram in GB (multiplied ×1000 internally → MB)
     query = (
         f"gpu_ram>={min_vram_gb} "
+        "compute_cap>=700 "
         "inet_up>200 "
+        "inet_down>=200 "
         "disk_space>60 "
         "cuda_vers>=12.0 "
         "reliability>0.95"
@@ -344,6 +347,7 @@ def search_offers(min_vram_gb: int = 12, max_price: float = 0.15) -> list[dict]:
         if o.get("reliability2", o.get("reliability", 0)) > 0.95
         and o.get("dph_total", 999) <= max_price
         and o.get("gpu_ram", 0) >= min_vram_gb * 1000
+        and o.get("compute_cap", 0) >= 700
     ]
     filtered.sort(key=lambda o: o["dph_total"])
     return filtered
@@ -392,17 +396,20 @@ def select_best_offer(offers: list[dict], min_vram_gb: int) -> dict:
 
 def print_top_offers(offers: list[dict], selected: dict, n: int = 5) -> None:
     """Print a formatted table of the top N offers."""
-    sep = "─" * 84
+    sep = "─" * 90
     print(f"\n{sep}")
     print(f"  {'Rank':<4}  {'ID':<12}  {'GPU':<22}  {'VRAM':>5}  {'$/hr':>7}  "
-          f"{'Reliability':>11}  {'CUDA':>5}")
+          f"{'Reliability':>11}  {'CUDA':>5}  {'CC':>4}")
     print(sep)
     for i, o in enumerate(offers[:n]):
         vram = round(o["gpu_ram"] / 1000)
         rel  = o.get("reliability2", o.get("reliability", 0))
+        cc   = o.get("compute_cap", 0)
+        cc_s = f"{cc // 100}.{cc % 100 // 10}" if cc else "?"
         mark = "  ◄ selected" if o["id"] == selected["id"] else ""
         print(f"  {i+1:<4}  {o['id']:<12}  {o['gpu_name']:<22}  {vram:>4}G  "
-              f"  ${o['dph_total']:>5.4f}  {rel:>11.4f}  {o['cuda_max_good']:>5}{mark}")
+              f"  ${o['dph_total']:>5.4f}  {rel:>11.4f}  {o['cuda_max_good']:>5}  "
+              f"{cc_s:>4}{mark}")
     print(sep)
 
 
@@ -538,10 +545,10 @@ def create_instance(offer_id: int, log: logging.Logger) -> int:
     Create a vast.ai instance.  Returns the new instance ID.
     Launched with --ssh --direct; no onstart script (deps installed via SSH).
     """
-    log.info("Creating instance from offer %d  (image: %s)...", offer_id, PYTORCH_IMAGE)
+    log.info("Creating instance from offer %d  (image: %s)...", offer_id, DOCKER_IMAGE)
     result = _vastai(
         "create", "instance", str(offer_id),
-        "--image",  PYTORCH_IMAGE,
+        "--image",  DOCKER_IMAGE,
         "--disk",   "80",
         "--ssh",
         "--direct",
@@ -578,7 +585,7 @@ def get_instance_info(instance_id: int) -> Optional[dict]:
 
 
 def wait_for_ssh(instance_id: int, log: logging.Logger,
-                 timeout: int = 600) -> tuple[str, int]:
+                 timeout: int = 1200) -> tuple[str, int]:
     """
     Poll until instance is running and SSH accepts connections.
     Returns (ssh_host, ssh_port).
@@ -629,14 +636,19 @@ apt-get update -qq
 apt-get install -y -qq rsync 2>/dev/null || true
 
 pip install -q --upgrade pip
+
+# numpy PINNED — cugraph breaks on newer versions
+pip install -q numpy==2.2.0
+
+# RAPIDS pinned to 26.02 (matches local arc_embed env)
+pip install -q --extra-index-url https://pypi.nvidia.com \
+    "cugraph-cu12>=26.2,<26.3" "cudf-cu12>=26.2,<26.3" 2>/dev/null \
+    && echo "[deps] RAPIDS 26.02 installed" \
+    || echo "[deps] RAPIDS unavailable — CPU fallback active"
+
 pip install -q sentence-transformers leidenalg psycopg2-binary boto3
 
 pip install -q faiss-gpu-cu12 2>/dev/null || pip install -q faiss-cpu
-
-pip install -q --extra-index-url https://pypi.nvidia.com \
-    cugraph-cu12 cudf-cu12 2>/dev/null \
-    && echo "[deps] RAPIDS installed" \
-    || echo "[deps] RAPIDS unavailable — CPU fallback active"
 
 echo "[deps] ARC dependencies ready."
 """
@@ -686,7 +698,7 @@ def destroy_instance(instance_id: int, log: logging.Logger) -> None:
 @contextmanager
 def managed_instance(offer: dict, cfg: dict, log: logging.Logger):
     """
-    Context manager: create instance, install deps, write R2 creds.
+    Context manager: create instance, write R2 creds.
     Guarantees destroy on exit regardless of success/failure.
 
     Yields (instance_id, ssh_host, ssh_port).
