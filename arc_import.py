@@ -42,9 +42,10 @@ import psycopg2
 # ─── DB connection ────────────────────────────────────────────────────────────
 
 DB_PARAMS = dict(
-    host="/var/run/postgresql",
-    dbname="arc_v5",
-    user="jeff",
+    host=os.environ.get("PGHOST", "/var/run/postgresql"),
+    dbname=os.environ.get("PGDATABASE", "arc_v5"),
+    user=os.environ.get("PGUSER", "jeff"),
+    password=os.environ.get("PGPASSWORD", ""),
 )
 
 # ─── Table definitions ────────────────────────────────────────────────────────
