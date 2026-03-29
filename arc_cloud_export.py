@@ -55,6 +55,10 @@ CUSTOM_LEIDEN_RES = {
     "H01L_quarterly": 2.0,
     "G06F_quarterly": 2.0,
     "G06N_quarterly": 1.5,
+    "A61P9_quarterly": 2.0,
+    "A61P25_quarterly": 2.0,
+    "C12N15_quarterly": 2.0,
+    "A61K38_quarterly": 2.0,
 }
 
 # Year-from defaults by corpus (from fallback configs)

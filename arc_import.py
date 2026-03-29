@@ -399,6 +399,20 @@ def import_corpus(corpus_id, input_dir, incremental=False, replace=False):
             rows = load_tsv(path, transform_fn)
             n = len(rows)
 
+            # Replace mode: DELETE old data BEFORE checking if new file has rows.
+            # 0 new rows means "this corpus has no data for this table" — the
+            # old data must still be removed.
+            if replace and n == 0:
+                with conn.cursor() as cur:
+                    cur.execute(f"DELETE FROM {table} WHERE corpus_id = %s",
+                                (corpus_id,))
+                    deleted = cur.rowcount
+                conn.commit()
+                label = f" (deleted {deleted} old rows)" if deleted else ""
+                print(f"  {table:<30} 0 rows (empty file){label}")
+                totals[table] = 0
+                continue
+
             if n == 0:
                 print(f"  {table:<30} 0 rows (empty file)")
                 totals[table] = 0
