@@ -45,9 +45,10 @@ log = logging.getLogger(__name__)
 # ── Config ────────────────────────────────────────────────────────────────────
 
 DB_PARAMS = dict(
-    host="/var/run/postgresql",
-    dbname="arc_v5",
-    user="jeff",
+    host=os.environ.get("PGHOST", "/var/run/postgresql"),
+    dbname=os.environ.get("PGDATABASE", "arc_v5"),
+    user=os.environ.get("PGUSER", "jeff"),
+    password=os.environ.get("PGPASSWORD", ""),
 )
 
 MODEL_DIR = Path(__file__).parent / "ml" / "models"
