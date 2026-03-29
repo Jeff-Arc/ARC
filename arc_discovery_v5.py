@@ -160,6 +160,7 @@ def get_conn():
         host=os.environ.get('PGHOST', '/var/run/postgresql'),
         dbname=os.environ.get('PGDATABASE', 'arc_v5'),
         user=os.environ.get('PGUSER', 'jeff'),
+        password=os.environ.get('PGPASSWORD', ''),
     )
 
 
