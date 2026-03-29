@@ -152,7 +152,10 @@ wait $PID_R2      && echo "[boot] $(date +%H:%M:%S) R2 ready" \
 # ── Step 4: torch LAST — force-reinstall overwrites RAPIDS CUDA libs ─
 pip install -q torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 \
     --index-url https://download.pytorch.org/whl/cu124 --force-reinstall
-echo "[boot] $(date +%H:%M:%S) torch installed (last — CUDA libs pinned)"
+# torch --force-reinstall pulls numpy 2.4 which breaks numba→cuDF→cuGraph.
+# Pin numpy back to 2.2.0 after torch to keep RAPIDS working.
+pip install -q numpy==2.2.0
+echo "[boot] $(date +%H:%M:%S) torch + numpy pinned"
 
 # ── Verify ───────────────────────────────────────────────────────────
 python3 -c "import torch; print('[boot] CUDA:', torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'N/A')"
