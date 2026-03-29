@@ -253,54 +253,86 @@ def parse_args():
                     help="Export locally only, skip R2 upload")
     ap.add_argument("--output-dir", type=Path, default=EXPORT_DIR,
                     help=f"Local output directory (default: {EXPORT_DIR})")
+    ap.add_argument("--workers", type=int, default=4,
+                    help="Parallel export workers (default: 4)")
     return ap.parse_args()
+
+
+def _export_one(corpus_id: str, output_dir: Path, force: bool, local_only: bool) -> tuple:
+    """Export + upload one corpus. Returns (corpus_id, count, error_or_None)."""
+    try:
+        conn = get_db_conn()
+        chunks_path, config_path, count = export_corpus(conn, corpus_id, output_dir)
+        conn.close()
+        if not local_only:
+            s3, bucket = make_r2_client()
+            upload_to_r2(s3, bucket, corpus_id, chunks_path, config_path, force)
+        return corpus_id, count, None
+    except Exception as e:
+        return corpus_id, 0, str(e)
 
 
 def main():
     args = parse_args()
-    conn = get_db_conn()
 
     if args.corpus == "list":
+        conn = get_db_conn()
         corpora = list_corpora(conn)
         print(f"\n{'Corpus':<35} {'Docs':>10}")
         print("-" * 47)
         for cid, n in corpora:
             print(f"{cid:<35} {n:>10,}")
         print(f"\nTotal: {len(corpora)} corpora, {sum(n for _, n in corpora):,} docs")
+        conn.close()
         return
 
     # Determine corpora to export
     if args.corpus == "all":
+        conn = get_db_conn()
         corpora = [cid for cid, _ in list_corpora(conn)]
+        conn.close()
     else:
         corpora = [c.strip() for c in args.corpus.split(",")]
 
-    # Connect to R2 if uploading
-    s3 = bucket = None
-    if not args.local_only:
-        s3, bucket = make_r2_client()
-
-    total_exported = 0
     t0 = time.time()
+    n_workers = min(args.workers, len(corpora))
 
-    for i, corpus_id in enumerate(corpora, 1):
-        print(f"\n{'='*60}")
-        print(f"[{i}/{len(corpora)}] {corpus_id}")
-        print(f"{'='*60}")
-
-        chunks_path, config_path, count = export_corpus(
-            conn, corpus_id, args.output_dir)
-        total_exported += count
-
-        if s3 and not args.local_only:
-            upload_to_r2(s3, bucket, corpus_id, chunks_path, config_path, args.force)
+    if n_workers <= 1:
+        # Sequential fallback
+        conn = get_db_conn()
+        s3 = bucket = None
+        if not args.local_only:
+            s3, bucket = make_r2_client()
+        total_exported = 0
+        for i, cid in enumerate(corpora, 1):
+            print(f"\n{'='*60}\n[{i}/{len(corpora)}] {cid}\n{'='*60}")
+            chunks_path, config_path, count = export_corpus(conn, cid, args.output_dir)
+            total_exported += count
+            if s3:
+                upload_to_r2(s3, bucket, cid, chunks_path, config_path, args.force)
+        conn.close()
+    else:
+        # Parallel export — each worker gets its own DB connection
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        print(f"Exporting {len(corpora)} corpora with {n_workers} workers...")
+        total_exported = 0
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            futures = {
+                pool.submit(_export_one, cid, args.output_dir, args.force, args.local_only): cid
+                for cid in corpora
+            }
+            for fut in as_completed(futures):
+                cid, count, err = fut.result()
+                if err:
+                    print(f"  FAILED {cid}: {err}")
+                else:
+                    total_exported += count
+                    print(f"  Done {cid}: {count:,} chunks")
 
     elapsed = time.time() - t0
     print(f"\n{'='*60}")
     print(f"Done: {len(corpora)} corpora, {total_exported:,} chunks in {elapsed:.0f}s")
     print(f"{'='*60}")
-
-    conn.close()
 
 
 if __name__ == "__main__":

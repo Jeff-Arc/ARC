@@ -604,16 +604,87 @@ def should_launch(pending_by_bin: dict[str, list],
     return launches
 
 
-def select_offer(offers: list[dict], history_prices: list[float]) -> dict | None:
+def _get_learned_chunks_per_sec(gpu_name: str, db_url: str) -> float | None:
+    """Query arc_cloud_instance_stats for historical embed speed of this GPU."""
+    try:
+        p = urlparse(db_url)
+        conn = psycopg2.connect(host=p.hostname, port=p.port or 5432,
+                                dbname=p.path.lstrip("/"), user=p.username,
+                                password=p.password)
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT AVG(embed_chunks_per_sec)
+                FROM arc_cloud_instance_stats
+                WHERE gpu_name = %s AND success = true AND embed_chunks_per_sec > 0
+                HAVING COUNT(*) >= 3
+            """, (gpu_name,))
+            row = cur.fetchone()
+        conn.close()
+        return float(row[0]) if row and row[0] else None
+    except Exception:
+        return None
+
+
+def estimate_total_cost(offer: dict, chunk_count: int = 100_000,
+                        db_url: str = None) -> float:
     """
-    Select best offer, preferring price-stable instances.
-    If history is available, penalize offers from hosts with volatile pricing.
+    Estimate total cost for a job on this offer.
+
+    total = (gpu_cost + disk_cost) × hours + network_cost
+    hours = embed_time + period_time + overhead
+    """
+    gpu_cost_hr = offer.get("dph_total", 0.10)
+    disk_gb = 25
+    storage_cost_gb_mo = offer.get("storage_cost", 0.20)
+    disk_cost_hr = (disk_gb * storage_cost_gb_mo) / (30 * 24)  # $/hr
+    net_cost_tb = offer.get("internet_up_cost_per_tb", 6.67)
+
+    # Estimate embed speed: learned > DLPerf proxy > default
+    gpu_name = offer.get("gpu_name", "")
+    learned_cps = _get_learned_chunks_per_sec(gpu_name, db_url) if db_url else None
+
+    if learned_cps:
+        chunks_per_sec = learned_cps
+    else:
+        # DLPerf proxy: scale from RTX 3060 baseline (73 chunks/sec)
+        dlperf = offer.get("dlperf", 10.0)
+        # RTX 3060 has dlperf ~12-15, does 73 cps
+        chunks_per_sec = max(10, (dlperf / 13.0) * 73.0)
+
+    embed_hours = chunk_count / (chunks_per_sec * 3600)
+    period_hours = 0.5  # ~30 min for period loop (varies by corpus)
+    overhead_hours = 0.15  # bootstrap, R2 transfer
+    total_hours = embed_hours + period_hours + overhead_hours
+
+    # Network: ~200MB upload + download per corpus
+    net_cost = (0.4 / 1000) * net_cost_tb  # 0.4 GB total transfer
+
+    total = (gpu_cost_hr + disk_cost_hr) * total_hours + net_cost
+    return total
+
+
+def select_offer(offers: list[dict], history_prices: list[float],
+                 chunk_count: int = 100_000, db_url: str = None) -> dict | None:
+    """
+    Select offer with lowest estimated total cost.
+    Uses learned embed speed from arc_cloud_instance_stats if available,
+    falls back to DLPerf proxy estimate.
     """
     if not offers:
         return None
-    # Simple: pick cheapest qualifying offer
-    # Future: could cross-reference host reliability from price history
-    return offers[0]
+
+    scored = []
+    for o in offers:
+        cost = estimate_total_cost(o, chunk_count, db_url)
+        scored.append((cost, o))
+    scored.sort(key=lambda x: x[0])
+
+    # Log top 3 for visibility
+    for cost, o in scored[:3]:
+        log_msg = (f"  {o.get('gpu_name','?'):20s} ${o.get('dph_total',0):.3f}/hr "
+                   f"est_total=${cost:.3f}")
+        # Can't call log here (no logger), just pick best
+    return scored[0][1]
 
 
 # ─── Main loop ────────────────────────────────────────────────────────────────
@@ -743,7 +814,13 @@ def _poll_cycle(conn, tracker: InstanceTracker, args, log, poll_count: int):
         for size_bin, min_vram in launches:
             bin_offers = offers_by_bin.get(size_bin, [])
             bin_history = history.get(size_bin, [])
-            offer = select_offer(bin_offers, bin_history)
+            # Estimate chunk count from first pending job in bin
+            avg_chunks = 100_000
+            bp = pending_by_bin.get(size_bin, [])
+            if bp:
+                avg_chunks = bp[0].get("chunk_count") or 100_000
+            offer = select_offer(bin_offers, bin_history,
+                                 chunk_count=avg_chunks, db_url=db_url)
 
             if not offer:
                 log.warning("No qualifying offer for %s (vram>=%dGB, <=$%.2f/hr)",
